@@ -19,6 +19,8 @@ export interface AdFilterInfo {
   removedSeconds?: number;
 }
 
+export type DownloadPhase = 'queued' | 'filter' | 'segments' | 'mux' | 'done';
+
 export interface ServerDownloadTask {
   id: string;
   title: string;
@@ -28,6 +30,10 @@ export interface ServerDownloadTask {
   message?: string;
   sourceName?: string;
   outputPath?: string;
+  /** 瞬时下载速度（字节/秒），任务级汇总 */
+  speedBps?: number;
+  /** 当前阶段 */
+  phase?: DownloadPhase;
   /** 任务级汇总：有任一集 removed 则 removed；否则 none */
   adFilter?: AdFilterInfo;
   /** 下载完成后通知 Emby 的结果（失败仅提示，不影响下载状态） */
@@ -46,6 +52,8 @@ export interface ServerDownloadTask {
     outputPath?: string;
     message?: string;
     adFilter?: AdFilterInfo;
+    speedBps?: number;
+    phase?: DownloadPhase;
   }>;
   createdAt: number;
   updatedAt: number;

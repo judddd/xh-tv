@@ -34,7 +34,10 @@ docker compose up -d --build
 | `DOWNLOAD_ALLOW_ROOTS` | `/media` | 可选手动路径的允许根（逗号分隔） |
 | `DOWNLOAD_STATE_FILE` | `/data/state/downloads.json` | 任务状态持久化 |
 | `DOWNLOAD_CONCURRENCY` | `2` | 同时下载任务数 |
-| `DOWNLOAD_EPISODE_CONCURRENCY` | `10` | 同一剧集任务内并行路数 |
+| `DOWNLOAD_EPISODE_CONCURRENCY` | `4` | 同一剧集任务内并行路数 |
+| `DOWNLOAD_SEGMENT_CONCURRENCY` | `12` | 单集内 HLS 分片并行数 |
+| `DOWNLOAD_GLOBAL_SEGMENT_CONCURRENCY` | `24` | 全进程分片连接上限 |
+| `DOWNLOAD_ENGINE` | `segments` | `segments` 并行拉片；`ffmpeg` 旧直拉 |
 | `DOWNLOAD_RETRIES` | `3` | 单集失败重试次数 |
 | `EMBY_URL` | （空=跳过） | Emby 地址，容器内可达，如 `http://host.docker.internal:8096` |
 | `EMBY_API_KEY` | （空=跳过） | Emby「API 密钥」页面生成的 Access Token |

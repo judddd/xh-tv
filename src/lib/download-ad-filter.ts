@@ -25,9 +25,15 @@ export interface AdFilterReport {
 }
 
 export interface PreparedPlaylist {
-  /** 本地绝对路径的过滤后 m3u8，给 ffmpeg -i */
+  /** 本地绝对路径的过滤后 m3u8，给 ffmpeg -i（远程分片绝对 URL） */
   localPath: string;
-  /** 探测用的「入口」仍可是原始 url；时长以过滤后为准时用 localPath */
+  /** 工作目录（含 index.m3u8）；cleanup 会删掉 */
+  workDir: string;
+  /** 绝对化后的 media playlist 文本 */
+  playlistText: string;
+  baseUrl: string;
+  segmentCount: number;
+  durationSec: number;
   adFilter: AdFilterReport;
   cleanup: () => void;
 }
@@ -179,12 +185,18 @@ export async function prepareFilteredPlaylist(
     throw new Error('去广告后无剩余分片，已中止以免写出空文件');
   }
 
+  const stats = countSegments(absolute);
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'libretv-dl-'));
   const localPath = path.join(dir, 'index.m3u8');
   fs.writeFileSync(localPath, absolute, 'utf8');
 
   return {
     localPath,
+    workDir: dir,
+    playlistText: absolute,
+    baseUrl,
+    segmentCount: stats.count,
+    durationSec: stats.seconds,
     adFilter: report,
     cleanup: () => {
       try {

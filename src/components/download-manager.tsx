@@ -177,7 +177,7 @@ export function DownloadManager({ isOpen, onClose }: { isOpen: boolean; onClose:
   useEffect(() => {
     if (!isOpen) return;
     void refresh();
-    const timer = setInterval(() => void refresh(), 2000);
+    const timer = setInterval(() => void refresh(), 1000);
     return () => clearInterval(timer);
   }, [isOpen, refresh]);
 
@@ -248,6 +248,20 @@ export function DownloadManager({ isOpen, onClose }: { isOpen: boolean; onClose:
     cancelled: '已取消',
   };
 
+  const formatSpeed = (bps?: number) => {
+    if (!bps || bps <= 0) return null;
+    if (bps < 1024) return `${Math.round(bps)} B/s`;
+    if (bps < 1024 * 1024) return `${(bps / 1024).toFixed(1)} KB/s`;
+    return `${(bps / (1024 * 1024)).toFixed(2)} MB/s`;
+  };
+
+  const phaseLabel = (phase?: string) => {
+    if (phase === 'segments') return '拉片';
+    if (phase === 'mux') return '封装';
+    if (phase === 'filter') return '去广告';
+    return null;
+  };
+
   const pickerDefaultKind: MediaKind =
     pending?.type === 'series'
       ? pending.payload.kind ?? 'tv'
@@ -268,7 +282,7 @@ export function DownloadManager({ isOpen, onClose }: { isOpen: boolean; onClose:
       <Drawer open={isOpen} onClose={onClose} title="下载管理" width="max-w-lg">
         <div className="space-y-3">
           <div className="card p-3 space-y-1">
-            <p className="text-sm text-content">服务端 ffmpeg 落盘（可暂停，可选手动目录）</p>
+            <p className="text-sm text-content">服务端并行拉片 + ffmpeg 封装（可暂停，显示实时速度）</p>
             <p className="text-xs text-faint">
               默认电影 → {roots?.movies || '/media/Movies'}
               <br />
@@ -295,7 +309,14 @@ export function DownloadManager({ isOpen, onClose }: { isOpen: boolean; onClose:
                     {t.episodes.length > 1
                       ? ` · ${t.episodes.filter((e) => e.status === 'completed').length}/${t.episodes.length} 集`
                       : ''}
+                    {phaseLabel(t.phase) ? ` · ${phaseLabel(t.phase)}` : ''}
                   </p>
+                  {(t.status === 'downloading' || t.status === 'paused') && formatSpeed(t.speedBps) && (
+                    <p className="text-sm font-medium text-accent tabular-nums mt-0.5">
+                      {formatSpeed(t.speedBps)}
+                      {t.progress != null ? ` · ${t.progress}%` : ''}
+                    </p>
+                  )}
                   {t.message && <p className="text-xs text-muted mt-0.5 break-all">{t.message}</p>}
                   {(t.adFilter || t.episodes.some((e) => e.adFilter)) && (
                     <p

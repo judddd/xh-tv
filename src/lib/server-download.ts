@@ -11,14 +11,21 @@ import path from 'node:path';
 import { isValidProxyUrl, isBlockedByDNS } from './ssrf';
 import { prepareFilteredPlaylist } from './download-ad-filter';
 import { notifyEmbyMediaUpdated } from './emby-notify';
+import {
+  downloadHlsSegments,
+  formatSpeedBps,
+  parseMediaPlaylist,
+} from './hls-segment-downloader';
 import type {
   AdFilterInfo,
+  DownloadPhase,
   MediaKind,
   ServerDownloadStatus,
   ServerDownloadTask,
 } from './server-download-types';
 
 export type { MediaKind, ServerDownloadStatus, ServerDownloadTask, AdFilterInfo } from './server-download-types';
+export { formatSpeedBps } from './hls-segment-downloader';
 
 export interface ServerDownloadEpisode {
   url: string;
@@ -46,12 +53,15 @@ const MOVIES_DIR = process.env.DOWNLOAD_MOVIES_DIR || '/media/Movies';
 const TV_DIR = process.env.DOWNLOAD_TV_DIR || '/media/TVShows';
 const STATE_FILE = process.env.DOWNLOAD_STATE_FILE || '/data/state/downloads.json';
 const MAX_CONCURRENT = Math.max(1, parseInt(process.env.DOWNLOAD_CONCURRENCY || '2', 10) || 2);
-/** 同一剧集任务内并行拉几集（ffmpeg 路数）；默认 10 */
+/** 同一剧集任务内并行拉几集；有分片并行后默认 4，避免互抢带宽 */
 const EPISODE_CONCURRENCY = Math.max(
   1,
-  parseInt(process.env.DOWNLOAD_EPISODE_CONCURRENCY || '10', 10) || 10
+  parseInt(process.env.DOWNLOAD_EPISODE_CONCURRENCY || '4', 10) || 4
 );
 const FFMPEG_RETRIES = Math.max(1, parseInt(process.env.DOWNLOAD_RETRIES || '3', 10) || 3);
+/** segments=并行拉片+本地封装（默认）；ffmpeg=旧链路直拉 */
+const DOWNLOAD_ENGINE = (process.env.DOWNLOAD_ENGINE || 'segments').toLowerCase();
+const KEEP_SEGS = process.env.DOWNLOAD_KEEP_SEGS === '1';
 
 /** 可选下载根：默认含 Movies/TV 及其父目录，可用 DOWNLOAD_ALLOW_ROOTS 追加（逗号分隔） */
 function parseAllowRoots(): string[] {
@@ -67,7 +77,44 @@ const tasks = new Map<string, ServerDownloadTask>();
 const abortControllers = new Map<string, AbortController>();
 /** 当前正在跑的 ffmpeg（同任务可多路），用于暂停（SIGSTOP）/继续（SIGCONT） */
 const runningProcs = new Map<string, Set<ChildProcess>>();
+/** 分片阶段暂停门闩：resume 时唤醒 */
+const pauseWaiters = new Map<string, Set<() => void>>();
 let activeCount = 0;
+
+function wakePauseWaiters(taskId: string): void {
+  const set = pauseWaiters.get(taskId);
+  if (!set?.size) return;
+  for (const wake of set) wake();
+  set.clear();
+}
+
+async function waitIfTaskPaused(taskId: string, signal: AbortSignal): Promise<void> {
+  while (true) {
+    if (signal.aborted) throw new Error('已取消');
+    const task = tasks.get(taskId);
+    if (!task || task.status !== 'paused') return;
+    await new Promise<void>((resolve, reject) => {
+      let set = pauseWaiters.get(taskId);
+      if (!set) {
+        set = new Set();
+        pauseWaiters.set(taskId, set);
+      }
+      const wake = () => {
+        set!.delete(wake);
+        signal.removeEventListener('abort', onAbort);
+        resolve();
+      };
+      const onAbort = () => {
+        set!.delete(wake);
+        reject(new Error('已取消'));
+      };
+      set.add(wake);
+      signal.addEventListener('abort', onAbort, { once: true });
+      // 若登记时已恢复，立刻醒
+      if (tasks.get(taskId)?.status !== 'paused') wake();
+    });
+  }
+}
 
 function trackProc(taskId: string, child: ChildProcess): void {
   let set = runningProcs.get(taskId);
@@ -403,7 +450,7 @@ function runFfmpegOnce(
       ...(isLocalList
         ? [
             '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data',
-            // HLS 多分片并行拉取（单集吞吐；剧集另有 EPISODE_CONCURRENCY）
+            '-http_persistent', '1',
             '-http_multiple', '1',
           ]
         : [
@@ -412,6 +459,7 @@ function runFfmpegOnce(
             '-reconnect_streamed', '1',
             '-reconnect_delay_max', '30',
             '-timeout', '30000000',
+            '-http_persistent', '1',
             '-http_multiple', '1',
           ]),
       '-i', input,
@@ -474,18 +522,25 @@ function runFfmpegOnce(
   });
 }
 
+type ProgressMeta = {
+  speedBps?: number;
+  phase?: DownloadPhase;
+  detail?: string;
+};
+
 async function downloadEpisodeFile(
   taskId: string,
   url: string,
   outputPath: string,
   signal: AbortSignal,
-  onProgress: (pct: number) => void,
+  onProgress: (pct: number, meta?: ProgressMeta) => void,
   onAdFilter?: (info: AdFilterInfo) => void
 ): Promise<AdFilterInfo> {
   await assertUrlAllowed(url);
   // 必须保留 .mp4 后缀：ffmpeg 靠扩展名选 muxer，`.mp4.part` 会被当成未知格式
   const part = `${outputPath}.part.mp4`;
-  // 清理残留临时文件
+  const segsDir = `${outputPath}.segs`;
+  // 清理残留临时 mp4（分片目录保留以支持续传）
   try {
     if (fs.existsSync(part)) fs.unlinkSync(part);
   } catch { /* ignore */ }
@@ -494,11 +549,11 @@ async function downloadEpisodeFile(
   if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 1024 * 100) {
     const skipped: AdFilterInfo = { status: 'none', label: '已存在文件，跳过（未重跑去广告）' };
     onAdFilter?.(skipped);
-    onProgress(100);
+    onProgress(100, { phase: 'done', speedBps: 0 });
     return skipped;
   }
 
-  // 下载前：拉 m3u8 → 保守 stripAdGroups → 临时清单给 ffmpeg（不事后裁切）
+  onProgress(0, { phase: 'filter', detail: '去广告处理中', speedBps: 0 });
   const prepared = await prepareFilteredPlaylist(url, signal);
   const adFilter: AdFilterInfo = {
     status: prepared.adFilter.status,
@@ -508,28 +563,91 @@ async function downloadEpisodeFile(
   };
   onAdFilter?.(adFilter);
 
-  try {
-    const durationSec = await probeDurationSec(prepared.localPath, signal);
+  const parsed = parseMediaPlaylist(prepared.playlistText);
+  const useSegments =
+    DOWNLOAD_ENGINE !== 'ffmpeg' && parsed.supportsParallel && parsed.segments.length > 0;
+  const durationSec = prepared.durationSec > 0 ? prepared.durationSec : parsed.totalDuration || null;
+
+  const runMux = async (input: string, mapProgress: (p: number) => number) => {
     let lastErr: unknown;
     for (let attempt = 1; attempt <= FFMPEG_RETRIES; attempt++) {
       if (signal.aborted) throw new Error('已取消');
+      await waitIfTaskPaused(taskId, signal);
       try {
-        await runFfmpegOnce(taskId, prepared.localPath, part, signal, onProgress, durationSec);
+        await runFfmpegOnce(
+          taskId,
+          input,
+          part,
+          signal,
+          (pct) => onProgress(mapProgress(pct), { phase: 'mux', detail: '封装 MP4' }),
+          durationSec
+        );
         fs.renameSync(part, outputPath);
-        onProgress(100);
-        return adFilter;
+        return;
       } catch (err) {
         lastErr = err;
         try {
           if (fs.existsSync(part)) fs.unlinkSync(part);
         } catch { /* ignore */ }
         if (signal.aborted) throw new Error('已取消');
-        if (attempt < FFMPEG_RETRIES) {
-          await new Promise((r) => setTimeout(r, 1500 * attempt));
-        }
+        if (attempt < FFMPEG_RETRIES) await new Promise((r) => setTimeout(r, 1500 * attempt));
       }
     }
     throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+  };
+
+  try {
+    if (useSegments) {
+      fs.mkdirSync(segsDir, { recursive: true });
+      // 把过滤后的远程清单也存一份，便于续传/排障
+      try {
+        fs.writeFileSync(path.join(segsDir, 'source.m3u8'), prepared.playlistText, 'utf8');
+      } catch { /* ignore */ }
+
+      await downloadHlsSegments(prepared.playlistText, {
+        workDir: segsDir,
+        signal,
+        resume: true,
+        waitIfPaused: () => waitIfTaskPaused(taskId, signal),
+        onProgress: (p) => {
+          const pct = Math.min(90, Math.round((p.done / Math.max(1, p.total)) * 90));
+          onProgress(pct, {
+            phase: 'segments',
+            speedBps: p.speedBps,
+            detail: `拉片 ${p.done}/${p.total} · ${formatSpeedBps(p.speedBps)}`,
+          });
+        },
+      });
+
+      const localList = path.join(segsDir, 'index.local.m3u8');
+      onProgress(90, { phase: 'mux', speedBps: 0, detail: '封装 MP4' });
+      await runMux(localList, (pct) => 90 + Math.round((pct / 100) * 9));
+
+      if (!KEEP_SEGS) {
+        try {
+          fs.rmSync(segsDir, { recursive: true, force: true });
+        } catch { /* ignore */ }
+      }
+      onProgress(100, { phase: 'done', speedBps: 0 });
+      return adFilter;
+    }
+
+    // 回退：ffmpeg 直拉（SAMPLE-AES / 显式 DOWNLOAD_ENGINE=ffmpeg）
+    onProgress(1, {
+      phase: 'mux',
+      detail: parsed.unsupportedReason
+        ? `回退 ffmpeg（${parsed.unsupportedReason}）`
+        : 'ffmpeg 直拉',
+      speedBps: 0,
+    });
+    // 时长未知时再 probe
+    const dur =
+      durationSec && durationSec > 0
+        ? durationSec
+        : await probeDurationSec(prepared.localPath, signal);
+    await runMux(prepared.localPath, (pct) => pct);
+    onProgress(100, { phase: 'done', speedBps: 0 });
+    return adFilter;
   } finally {
     prepared.cleanup();
   }
@@ -539,14 +657,19 @@ function refreshTaskProgress(task: ServerDownloadTask): void {
   const total = task.episodes.length || 1;
   const sumPct = task.episodes.reduce((s, e) => s + Math.min(100, Math.max(0, e.progress || 0)), 0);
   const done = task.episodes.filter((e) => e.status === 'completed').length;
-  const active = task.episodes.filter((e) => e.status === 'downloading').length;
+  const activeEps = task.episodes.filter((e) => e.status === 'downloading');
+  const speedBps = activeEps.reduce((s, e) => s + (e.speedBps || 0), 0);
+  const phase = activeEps.find((e) => e.phase)?.phase;
   const overall = Math.min(99, Math.round(sumPct / total));
+  const speedLabel = speedBps > 0 ? ` · ${formatSpeedBps(speedBps)}` : '';
   touch(task, {
     status: task.status === 'paused' ? 'paused' : 'downloading',
     progress: overall,
+    speedBps: speedBps > 0 ? speedBps : undefined,
+    phase,
     message:
-      active > 0
-        ? `并行 ${active} 路 · 已完成 ${done}/${total}`
+      activeEps.length > 0
+        ? `并行 ${activeEps.length} 路 · 已完成 ${done}/${total}${speedLabel}`
         : `已完成 ${done}/${total}`,
   });
 }
@@ -580,9 +703,12 @@ async function runEpisodesPool(
           ep.url,
           ep.outputPath!,
           signal,
-          (pct) => {
+          (pct, meta) => {
             if (task.status === 'paused') return;
             ep.progress = pct;
+            if (meta?.speedBps != null) ep.speedBps = meta.speedBps;
+            if (meta?.phase) ep.phase = meta.phase;
+            if (meta?.detail) ep.message = meta.detail;
             refreshTaskProgress(task);
           },
           (info) => {
@@ -594,6 +720,8 @@ async function runEpisodesPool(
         ep.adFilter = adFilter;
         ep.status = 'completed';
         ep.progress = 100;
+        ep.speedBps = 0;
+        ep.phase = 'done';
         ep.message = adFilter.label;
         refreshTaskProgress(task);
       } catch (err) {
@@ -676,6 +804,8 @@ async function runTask(task: ServerDownloadTask): Promise<void> {
     touch(task, {
       status: 'completed',
       progress: 100,
+      speedBps: 0,
+      phase: 'done',
       adFilter,
       message: baseMsg,
       outputPath,
@@ -733,42 +863,49 @@ function schedulePump(): void {
   }
 }
 
-/** 暂停：SIGSTOP 挂起该任务下全部 ffmpeg */
+/** 暂停：SIGSTOP 挂起 ffmpeg；分片阶段靠 waitIfPaused 门闩停发请求 */
 export function pauseServerDownload(id: string): boolean {
   ensureLoaded();
   const task = tasks.get(id);
   if (!task || task.status !== 'downloading') return false;
   signalTaskProcs(id, 'SIGSTOP');
-  touch(task, { status: 'paused', message: '已暂停' });
+  touch(task, { status: 'paused', message: '已暂停', speedBps: 0 });
   for (const ep of task.episodes) {
-    if (ep.status === 'downloading') ep.message = '已暂停';
+    if (ep.status === 'downloading') {
+      ep.message = '已暂停';
+      ep.speedBps = 0;
+    }
   }
   return true;
 }
 
-/** 继续：SIGCONT 恢复该任务下全部 ffmpeg */
+/** 继续：SIGCONT 恢复 ffmpeg，并唤醒分片下载门闩 */
 export function resumeServerDownload(id: string): boolean {
   ensureLoaded();
   const task = tasks.get(id);
   if (!task || task.status !== 'paused') return false;
-  const n = signalTaskProcs(id, 'SIGCONT');
-  if (n === 0 && !(runningProcs.get(id)?.size)) {
-    // 无存活进程（暂停卡在探时长/排队）→ 重新排队整任务
-    touch(task, { status: 'waiting', message: '重新排队' });
+  signalTaskProcs(id, 'SIGCONT');
+
+  // runTask 仍在（有 AbortController）→ 只恢复状态并唤醒拉片工人
+  if (abortControllers.has(id)) {
+    touch(task, { status: 'downloading', message: '继续下载' });
     for (const ep of task.episodes) {
-      if (ep.status === 'downloading' || ep.status === 'paused') {
-        ep.status = 'waiting';
-        ep.message = '等待继续';
-      }
+      if (ep.status === 'downloading') ep.message = '下载中';
     }
-    if (!abortControllers.has(id)) abortControllers.set(id, new AbortController());
-    schedulePump();
+    wakePauseWaiters(id);
     return true;
   }
-  touch(task, { status: 'downloading', message: '继续下载' });
+
+  // runTask 已结束：重新排队（分片目录可续传）
+  touch(task, { status: 'waiting', message: '重新排队' });
   for (const ep of task.episodes) {
-    if (ep.status === 'downloading') ep.message = '下载中';
+    if (ep.status === 'downloading' || ep.status === 'paused') {
+      ep.status = 'waiting';
+      ep.message = '等待继续';
+    }
   }
+  abortControllers.set(id, new AbortController());
+  schedulePump();
   return true;
 }
 
