@@ -11,8 +11,10 @@ import { cn } from '@/lib/utils';
 export interface DownloadFolderChoice {
   targetDir: string;
   kind: MediaKind;
-  /** series: 全剧；episode: 仅当前/单集（由调用方解释） */
-  scope: 'series' | 'episode';
+  /** all: 全剧；range: episodeFrom..episodeTo（1 基，含两端） */
+  scope: 'all' | 'range';
+  episodeFrom?: number;
+  episodeTo?: number;
 }
 
 interface Props {
@@ -20,7 +22,7 @@ interface Props {
   title: string;
   /** 根据片源自动推断的默认类型 */
   defaultKind: MediaKind;
-  /** 是否显示「下载全剧」选项（多集时） */
+  /** 是否显示集数范围（多集时） */
   allowSeries?: boolean;
   episodeCount?: number;
   onConfirm: (choice: DownloadFolderChoice) => void;
@@ -30,7 +32,8 @@ interface Props {
 /**
  * 下载前选目录弹窗：
  * - 默认 Movies / TVShows；
- * - 可浏览允许根下任意子文件夹，也可手输路径、新建文件夹。
+ * - 可浏览允许根下任意子文件夹，也可手输路径、新建文件夹；
+ * - 多集时可「全剧」或指定起止集。
  */
 export function DownloadFolderPicker({
   open,
@@ -45,7 +48,9 @@ export function DownloadFolderPicker({
   const panelRef = useRef<HTMLDivElement>(null);
   useFocusTrap(open, panelRef);
   const [kind, setKind] = useState<MediaKind>(defaultKind);
-  const [scope, setScope] = useState<'series' | 'episode'>(allowSeries ? 'series' : 'episode');
+  const [scope, setScope] = useState<'all' | 'range'>(allowSeries ? 'all' : 'range');
+  const [epFrom, setEpFrom] = useState(1);
+  const [epTo, setEpTo] = useState(Math.max(1, episodeCount));
   const [roots, setRoots] = useState<{ movies: string; tv: string } | null>(null);
   const [current, setCurrent] = useState<string | null>(null);
   const [parent, setParent] = useState<string | null>(null);
@@ -66,7 +71,6 @@ export function DownloadFolderPicker({
         const def = defaultKind === 'tv' ? data.roots.tv : data.roots.movies;
         setCustomPath(def);
         setCurrent(def);
-        // 再拉一层默认目录内容
         const inner = await api.downloadBrowse(def);
         setCurrent(inner.current);
         setParent(inner.parent);
@@ -87,9 +91,11 @@ export function DownloadFolderPicker({
   useEffect(() => {
     if (!open) return;
     setKind(defaultKind);
-    setScope(allowSeries ? 'series' : 'episode');
+    setScope(allowSeries ? 'all' : 'range');
+    setEpFrom(1);
+    setEpTo(Math.max(1, episodeCount));
     void load(null);
-  }, [open, defaultKind, allowSeries, load]);
+  }, [open, defaultKind, allowSeries, episodeCount, load]);
 
   useEffect(() => {
     if (!open) return;
@@ -108,13 +114,38 @@ export function DownloadFolderPicker({
     if (def) void load(def);
   };
 
+  const clampRange = () => {
+    const max = Math.max(1, episodeCount);
+    let from = Math.min(max, Math.max(1, Math.floor(epFrom) || 1));
+    let to = Math.min(max, Math.max(1, Math.floor(epTo) || 1));
+    if (from > to) [from, to] = [to, from];
+    return { from, to };
+  };
+
   const confirm = () => {
     const target = customPath.trim();
     if (!target) {
       toast('请选择或输入保存目录', 'error');
       return;
     }
-    onConfirm({ targetDir: target, kind, scope });
+    if (allowSeries && scope === 'range') {
+      const { from, to } = clampRange();
+      onConfirm({
+        targetDir: target,
+        kind,
+        scope: 'range',
+        episodeFrom: from,
+        episodeTo: to,
+      });
+      return;
+    }
+    onConfirm({
+      targetDir: target,
+      kind,
+      scope: allowSeries ? 'all' : 'range',
+      episodeFrom: allowSeries ? 1 : 1,
+      episodeTo: allowSeries ? episodeCount : 1,
+    });
   };
 
   const createFolder = async () => {
@@ -128,6 +159,12 @@ export function DownloadFolderPicker({
       toast(err instanceof Error ? err.message : '创建失败', 'error');
     }
   };
+
+  const rangePreview = (() => {
+    if (!allowSeries || scope !== 'range') return null;
+    const { from, to } = clampRange();
+    return from === to ? `第 ${from} 集` : `第 ${from}–${to} 集（共 ${to - from + 1} 集）`;
+  })();
 
   return (
     <div
@@ -174,21 +211,52 @@ export function DownloadFolderPicker({
               <>
                 <button
                   type="button"
-                  className={cn('btn-ghost btn-sm', scope === 'series' && 'bg-accent/15 text-accent')}
-                  onClick={() => setScope('series')}
+                  className={cn('btn-ghost btn-sm', scope === 'all' && 'bg-accent/15 text-accent')}
+                  onClick={() => setScope('all')}
                 >
                   下载全剧（{episodeCount} 集）
                 </button>
                 <button
                   type="button"
-                  className={cn('btn-ghost btn-sm', scope === 'episode' && 'bg-accent/15 text-accent')}
-                  onClick={() => setScope('episode')}
+                  className={cn('btn-ghost btn-sm', scope === 'range' && 'bg-accent/15 text-accent')}
+                  onClick={() => setScope('range')}
                 >
-                  仅下载第 1 集
+                  选择集数范围
                 </button>
               </>
             )}
           </div>
+
+          {allowSeries && scope === 'range' && (
+            <div className="rounded-lg border border-line p-3 space-y-2">
+              <p className="text-xs text-faint">集数范围（1–{episodeCount}）</p>
+              <div className="flex items-center gap-2">
+                <label className="text-xs text-muted shrink-0">从</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={episodeCount}
+                  className="w-20 rounded-lg border border-line bg-chip px-2 py-1.5 text-sm text-content tabular-nums"
+                  value={epFrom}
+                  onChange={(e) => setEpFrom(Number(e.target.value))}
+                />
+                <label className="text-xs text-muted shrink-0">到</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={episodeCount}
+                  className="w-20 rounded-lg border border-line bg-chip px-2 py-1.5 text-sm text-content tabular-nums"
+                  value={epTo}
+                  onChange={(e) => setEpTo(Number(e.target.value))}
+                />
+                {rangePreview && <span className="text-xs text-accent ml-1">{rangePreview}</span>}
+              </div>
+            </div>
+          )}
+
+          <p className="text-[11px] text-faint leading-relaxed">
+            下载时自动按源站广告标记（如 adjump / 可识别中插段）剔除；无标记的源会提示「可能仍有残留」，不事后裁切正片。
+          </p>
 
           <div>
             <label className="text-xs text-faint block mb-1">保存路径（可改）</label>
@@ -236,10 +304,6 @@ export function DownloadFolderPicker({
                     onClick={() => {
                       setCustomPath(d.path);
                       void load(d.path);
-                    }}
-                    onDoubleClick={() => {
-                      setCustomPath(d.path);
-                      onConfirm({ targetDir: d.path, kind, scope });
                     }}
                   >
                     📁 {d.name}

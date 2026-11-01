@@ -7,6 +7,7 @@ import { useToast } from './toast';
 import { api, ApiError } from '@/lib/client-api';
 import type { MediaKind, ServerDownloadTask } from '@/lib/server-download-types';
 import { DownloadFolderPicker, type DownloadFolderChoice } from './download-folder-picker';
+import { cn } from '@/lib/utils';
 
 /**
  * 服务端下载管理器：
@@ -91,9 +92,19 @@ export function DownloadManager({ isOpen, onClose }: { isOpen: boolean; onClose:
       const kind = choice?.kind ?? payload.kind ?? 'tv';
       const targetDir = choice?.targetDir ?? payload.targetDir ?? roots?.tv;
       let episodes = payload.episodes;
-      if (choice?.scope === 'episode') {
-        episodes = episodes.slice(0, 1);
+      if (choice?.scope === 'range' && choice.episodeFrom && choice.episodeTo) {
+        const from = Math.min(choice.episodeFrom, choice.episodeTo);
+        const to = Math.max(choice.episodeFrom, choice.episodeTo);
+        episodes = payload.episodes.filter((e) => {
+          const n = e.episode ?? 0;
+          return n >= from && n <= to;
+        });
+        if (!episodes.length) {
+          // 无 episode 字段时按数组下标（1 基）切片
+          episodes = payload.episodes.slice(from - 1, to);
+        }
       }
+      if (!episodes.length) throw new Error('所选集数范围内没有可下载条目');
       await api.downloadCreate({
         title: payload.title,
         kind,
@@ -101,12 +112,13 @@ export function DownloadManager({ isOpen, onClose }: { isOpen: boolean; onClose:
         targetDir,
         episodes,
       });
-      toast(
-        choice?.scope === 'episode'
-          ? `《${payload.title}》第 1 集已加入下载`
-          : `《${payload.title}》全剧 ${episodes.length} 集已加入下载`,
-        'success'
-      );
+      const rangeLabel =
+        choice?.scope === 'range' && choice.episodeFrom && choice.episodeTo
+          ? choice.episodeFrom === choice.episodeTo
+            ? `第 ${choice.episodeFrom} 集`
+            : `第 ${Math.min(choice.episodeFrom, choice.episodeTo)}–${Math.max(choice.episodeFrom, choice.episodeTo)} 集`
+          : `全剧 ${episodes.length} 集`;
+      toast(`《${payload.title}》${rangeLabel}已加入下载`, 'success');
       await refresh();
       window.dispatchEvent(new CustomEvent(SHOW_MANAGER_EVENT));
     },
@@ -277,6 +289,19 @@ export function DownloadManager({ isOpen, onClose }: { isOpen: boolean; onClose:
                       : ''}
                   </p>
                   {t.message && <p className="text-xs text-muted mt-0.5 break-all">{t.message}</p>}
+                  {(t.adFilter || t.episodes.some((e) => e.adFilter)) && (
+                    <p
+                      className={cn(
+                        'text-xs mt-0.5',
+                        (t.adFilter ?? t.episodes.find((e) => e.adFilter)?.adFilter)?.status ===
+                          'removed'
+                          ? 'text-accent'
+                          : 'text-amber-600 dark:text-amber-400'
+                      )}
+                    >
+                      {(t.adFilter ?? t.episodes.find((e) => e.adFilter)?.adFilter)?.label}
+                    </p>
+                  )}
                   {t.outputPath && t.status === 'completed' && (
                     <p className="text-xs text-faint mt-0.5 break-all">{t.outputPath}</p>
                   )}

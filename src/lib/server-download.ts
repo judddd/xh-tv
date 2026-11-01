@@ -9,9 +9,15 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { isValidProxyUrl, isBlockedByDNS } from './ssrf';
-import type { MediaKind, ServerDownloadStatus, ServerDownloadTask } from './server-download-types';
+import { prepareFilteredPlaylist } from './download-ad-filter';
+import type {
+  AdFilterInfo,
+  MediaKind,
+  ServerDownloadStatus,
+  ServerDownloadTask,
+} from './server-download-types';
 
-export type { MediaKind, ServerDownloadStatus, ServerDownloadTask } from './server-download-types';
+export type { MediaKind, ServerDownloadStatus, ServerDownloadTask, AdFilterInfo } from './server-download-types';
 
 export interface ServerDownloadEpisode {
   url: string;
@@ -219,9 +225,12 @@ function probeDurationSec(url: string, signal: AbortSignal): Promise<number | nu
   return new Promise((resolve) => {
     // 进度条可选：探时长最多 12s，超时直接开下，避免卡死在 ffprobe
     const PROBE_TIMEOUT_MS = 12_000;
+    const isLocal = url.endsWith('.m3u8') && !/^https?:\/\//i.test(url);
     const args = [
       '-v', 'error',
-      '-user_agent', UA,
+      ...(isLocal
+        ? ['-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data']
+        : ['-user_agent', UA]),
       '-probesize', '32k',
       '-analyzeduration', '2000000',
       '-show_entries', 'format=duration',
@@ -264,7 +273,7 @@ function probeDurationSec(url: string, signal: AbortSignal): Promise<number | nu
 
 function runFfmpegOnce(
   taskId: string,
-  url: string,
+  input: string,
   outPart: string,
   signal: AbortSignal,
   onProgress: (pct: number) => void,
@@ -272,18 +281,25 @@ function runFfmpegOnce(
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     fs.mkdirSync(path.dirname(outPart), { recursive: true });
+    // 本地过滤后的 m3u8：file 输入不能带 http 专用选项（-headers/-user_agent/-reconnect/-timeout
+    // 会报 Option not found）。子分片走 https 时靠 protocol_whitelist + 默认 UA 即可。
+    const isLocalList = input.endsWith('.m3u8') && !/^https?:\/\//i.test(input);
     const args = [
       '-y',
       '-hide_banner',
       '-nostdin',
       '-loglevel', 'error',
       '-stats',
-      '-user_agent', UA,
-      '-reconnect', '1',
-      '-reconnect_streamed', '1',
-      '-reconnect_delay_max', '30',
-      '-timeout', '30000000',
-      '-i', url,
+      ...(isLocalList
+        ? ['-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data']
+        : [
+            '-user_agent', UA,
+            '-reconnect', '1',
+            '-reconnect_streamed', '1',
+            '-reconnect_delay_max', '30',
+            '-timeout', '30000000',
+          ]),
+      '-i', input,
       '-c', 'copy',
       '-bsf:a', 'aac_adtstoasc',
       '-movflags', '+faststart',
@@ -348,8 +364,9 @@ async function downloadEpisodeFile(
   url: string,
   outputPath: string,
   signal: AbortSignal,
-  onProgress: (pct: number) => void
-): Promise<void> {
+  onProgress: (pct: number) => void,
+  onAdFilter?: (info: AdFilterInfo) => void
+): Promise<AdFilterInfo> {
   await assertUrlAllowed(url);
   // 必须保留 .mp4 后缀：ffmpeg 靠扩展名选 muxer，`.mp4.part` 会被当成未知格式
   const part = `${outputPath}.part.mp4`;
@@ -358,33 +375,49 @@ async function downloadEpisodeFile(
     if (fs.existsSync(part)) fs.unlinkSync(part);
   } catch { /* ignore */ }
 
-  // 已存在完整文件则跳过
+  // 已存在完整文件则跳过（无法回溯当时过滤结果）
   if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 1024 * 100) {
+    const skipped: AdFilterInfo = { status: 'none', label: '已存在文件，跳过（未重跑去广告）' };
+    onAdFilter?.(skipped);
     onProgress(100);
-    return;
+    return skipped;
   }
 
-  const durationSec = await probeDurationSec(url, signal);
-  let lastErr: unknown;
-  for (let attempt = 1; attempt <= FFMPEG_RETRIES; attempt++) {
-    if (signal.aborted) throw new Error('已取消');
-    try {
-      await runFfmpegOnce(taskId, url, part, signal, onProgress, durationSec);
-      fs.renameSync(part, outputPath);
-      onProgress(100);
-      return;
-    } catch (err) {
-      lastErr = err;
-      try {
-        if (fs.existsSync(part)) fs.unlinkSync(part);
-      } catch { /* ignore */ }
+  // 下载前：拉 m3u8 → 保守 stripAdGroups → 临时清单给 ffmpeg（不事后裁切）
+  const prepared = await prepareFilteredPlaylist(url, signal);
+  const adFilter: AdFilterInfo = {
+    status: prepared.adFilter.status,
+    label: prepared.adFilter.label,
+    removedSegments: prepared.adFilter.removedSegments,
+    removedSeconds: prepared.adFilter.removedSeconds,
+  };
+  onAdFilter?.(adFilter);
+
+  try {
+    const durationSec = await probeDurationSec(prepared.localPath, signal);
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= FFMPEG_RETRIES; attempt++) {
       if (signal.aborted) throw new Error('已取消');
-      if (attempt < FFMPEG_RETRIES) {
-        await new Promise((r) => setTimeout(r, 1500 * attempt));
+      try {
+        await runFfmpegOnce(taskId, prepared.localPath, part, signal, onProgress, durationSec);
+        fs.renameSync(part, outputPath);
+        onProgress(100);
+        return adFilter;
+      } catch (err) {
+        lastErr = err;
+        try {
+          if (fs.existsSync(part)) fs.unlinkSync(part);
+        } catch { /* ignore */ }
+        if (signal.aborted) throw new Error('已取消');
+        if (attempt < FFMPEG_RETRIES) {
+          await new Promise((r) => setTimeout(r, 1500 * attempt));
+        }
       }
     }
+    throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
+  } finally {
+    prepared.cleanup();
   }
-  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
 
 async function runTask(task: ServerDownloadTask): Promise<void> {
@@ -411,16 +444,33 @@ async function runTask(task: ServerDownloadTask): Promise<void> {
 
       const out = ep.outputPath!;
       try {
-        await downloadEpisodeFile(task.id, ep.url, out, signal, (pct) => {
-          // 暂停期间仍可能收到进度，但 UI 状态以 paused 为准
-          if (task.status === 'paused') return;
-          ep.progress = pct;
-          const overall = Math.round(((done + pct / 100) / total) * 100);
-          touch(task, { progress: Math.min(99, overall), message: `第 ${i + 1}/${total} 集 ${pct}%` });
-        });
+        const adFilter = await downloadEpisodeFile(
+          task.id,
+          ep.url,
+          out,
+          signal,
+          (pct) => {
+            // 暂停期间仍可能收到进度，但 UI 状态以 paused 为准
+            if (task.status === 'paused') return;
+            ep.progress = pct;
+            const overall = Math.round(((done + pct / 100) / total) * 100);
+            touch(task, {
+              progress: Math.min(99, overall),
+              message: `第 ${i + 1}/${total} 集 ${pct}% · ${ep.adFilter?.label || '去广告处理中'}`,
+            });
+          },
+          (info) => {
+            ep.adFilter = info;
+            ep.message = info.label;
+            touch(task, {
+              message: `第 ${i + 1}/${total} 集 · ${info.label}`,
+            });
+          }
+        );
+        ep.adFilter = adFilter;
         ep.status = 'completed';
         ep.progress = 100;
-        ep.message = '完成';
+        ep.message = adFilter.label;
         done += 1;
         touch(task, {
           status: 'downloading',
@@ -443,10 +493,27 @@ async function runTask(task: ServerDownloadTask): Promise<void> {
       touch(task, { status: 'error', message: failed ? '全部失败' : '无成功文件', progress: 0 });
       return;
     }
+    const removedEps = task.episodes.filter((e) => e.adFilter?.status === 'removed');
+    const removedSec = removedEps.reduce((s, e) => s + (e.adFilter?.removedSeconds || 0), 0);
+    const adFilter: AdFilterInfo =
+      removedEps.length > 0
+        ? {
+            status: 'removed',
+            label: `已剔除广告（${removedEps.length}/${completed} 集，约 ${Math.round(removedSec)} 秒）`,
+            removedSeconds: removedSec,
+            removedSegments: removedEps.reduce((s, e) => s + (e.adFilter?.removedSegments || 0), 0),
+          }
+        : {
+            status: 'none',
+            label: '未检测到可识别广告标记（可能仍有残留）',
+          };
     touch(task, {
       status: 'completed',
       progress: 100,
-      message: failed ? `完成 ${completed}/${total}（${failed} 集失败）` : '全部完成',
+      adFilter,
+      message: failed
+        ? `完成 ${completed}/${total}（${failed} 集失败）· ${adFilter.label}`
+        : `全部完成 · ${adFilter.label}`,
       outputPath: task.kind === 'movie' ? task.episodes[0]?.outputPath : path.dirname(task.episodes[0]?.outputPath || ''),
     });
   } catch (err) {
