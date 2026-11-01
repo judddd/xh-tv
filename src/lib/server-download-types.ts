@@ -30,9 +30,16 @@ export interface ServerDownloadTask {
   outputPath?: string;
   /** 任务级汇总：有任一集 removed 则 removed；否则 none */
   adFilter?: AdFilterInfo;
+  /** 下载完成后通知 Emby 的结果（失败仅提示，不影响下载状态） */
+  embyNotify?: {
+    ok: boolean;
+    message: string;
+    skipped?: boolean;
+  };
   episodes: Array<{
     url: string;
     episode?: number;
+    season?: number;
     title?: string;
     status: ServerDownloadStatus;
     progress: number;

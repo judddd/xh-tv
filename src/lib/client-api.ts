@@ -304,7 +304,7 @@ export const api = {
     kind?: 'movie' | 'tv';
     sourceName?: string;
     targetDir?: string;
-    episodes: Array<{ url: string; episode?: number; title?: string }>;
+    episodes: Array<{ url: string; episode?: number; season?: number; title?: string }>;
   }) =>
     request<{
       task: import('./server-download-types').ServerDownloadTask;

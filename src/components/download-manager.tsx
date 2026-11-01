@@ -25,6 +25,7 @@ export interface AddDownloadPayload {
   title: string;
   kind?: MediaKind;
   episode?: number;
+  season?: number;
   sourceName?: string;
   targetDir?: string;
   /** 若未带 targetDir，弹窗选择；skipPicker=true 时用默认目录 */
@@ -38,7 +39,7 @@ export interface AddSeriesDownloadPayload {
   sourceName?: string;
   targetDir?: string;
   skipPicker?: boolean;
-  episodes: Array<{ url: string; episode?: number; title?: string }>;
+  episodes: Array<{ url: string; episode?: number; season?: number; title?: string }>;
 }
 
 type Pending =
@@ -71,14 +72,21 @@ export function DownloadManager({ isOpen, onClose }: { isOpen: boolean; onClose:
         (kind === 'tv' ? roots?.tv : roots?.movies);
       const epTitle =
         kind === 'tv' && payload.episode
-          ? `${payload.title} - E${String(payload.episode).padStart(2, '0')}`
+          ? `${payload.title} S${String(payload.season && payload.season > 0 ? payload.season : 1).padStart(2, '0')}E${String(payload.episode).padStart(2, '0')}`
           : undefined;
       await api.downloadCreate({
         title: payload.title,
         kind,
         sourceName: payload.sourceName,
         targetDir,
-        episodes: [{ url: payload.url, episode: payload.episode, title: epTitle }],
+        episodes: [
+          {
+            url: payload.url,
+            episode: payload.episode,
+            season: payload.season,
+            title: epTitle,
+          },
+        ],
       });
       toast(`《${payload.title}》已加入下载`, 'success');
       await refresh();
@@ -300,6 +308,16 @@ export function DownloadManager({ isOpen, onClose }: { isOpen: boolean; onClose:
                       )}
                     >
                       {(t.adFilter ?? t.episodes.find((e) => e.adFilter)?.adFilter)?.label}
+                    </p>
+                  )}
+                  {t.embyNotify && !t.embyNotify.skipped && (
+                    <p
+                      className={cn(
+                        'text-xs mt-0.5',
+                        t.embyNotify.ok ? 'text-accent' : 'text-amber-600 dark:text-amber-400'
+                      )}
+                    >
+                      {t.embyNotify.message}
                     </p>
                   )}
                   {t.outputPath && t.status === 'completed' && (

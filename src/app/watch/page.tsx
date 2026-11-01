@@ -295,7 +295,7 @@ function WatchContent() {
                 const isSeries = episodes.length > 1;
                 enqueueDownload({
                   url: currentUrl,
-                  // 剧集任务标题用剧名；文件名由服务端按 E01 规则生成
+                  // 剧集任务标题用剧名；文件名由服务端按 Season N / SxxExx 生成
                   title: videoTitle,
                   kind: isSeries ? 'tv' : 'movie',
                   episode: isSeries ? currentIndex + 1 : undefined,
@@ -311,7 +311,12 @@ function WatchContent() {
                 className="btn-ghost btn-sm"
                 onClick={() => {
                   const list = episodes
-                    .map((url, i) => ({ url, episode: i + 1, title: `${videoTitle} - E${String(i + 1).padStart(2, '0')}` }))
+                    .map((url, i) => ({
+                      url,
+                      episode: i + 1,
+                      season: 1,
+                      title: `${videoTitle} S01E${String(i + 1).padStart(2, '0')}`,
+                    }))
                     .filter((e) => Boolean(e.url));
                   if (!list.length) {
                     toast('没有可下载的剧集地址', 'error');

@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { isValidProxyUrl, isBlockedByDNS } from './ssrf';
 import { prepareFilteredPlaylist } from './download-ad-filter';
+import { notifyEmbyMediaUpdated } from './emby-notify';
 import type {
   AdFilterInfo,
   MediaKind,
@@ -23,6 +24,8 @@ export interface ServerDownloadEpisode {
   url: string;
   /** 集数（1 基）；电影可省略 */
   episode?: number;
+  /** 季数（1 基）；缺省时从剧名「第N季」解析，再不行默认 1 */
+  season?: number;
   title?: string;
 }
 
@@ -43,6 +46,11 @@ const MOVIES_DIR = process.env.DOWNLOAD_MOVIES_DIR || '/media/Movies';
 const TV_DIR = process.env.DOWNLOAD_TV_DIR || '/media/TVShows';
 const STATE_FILE = process.env.DOWNLOAD_STATE_FILE || '/data/state/downloads.json';
 const MAX_CONCURRENT = Math.max(1, parseInt(process.env.DOWNLOAD_CONCURRENCY || '2', 10) || 2);
+/** 同一剧集任务内并行拉几集（ffmpeg 路数）；默认 10 */
+const EPISODE_CONCURRENCY = Math.max(
+  1,
+  parseInt(process.env.DOWNLOAD_EPISODE_CONCURRENCY || '10', 10) || 10
+);
 const FFMPEG_RETRIES = Math.max(1, parseInt(process.env.DOWNLOAD_RETRIES || '3', 10) || 3);
 
 /** 可选下载根：默认含 Movies/TV 及其父目录，可用 DOWNLOAD_ALLOW_ROOTS 追加（逗号分隔） */
@@ -57,9 +65,41 @@ function parseAllowRoots(): string[] {
 
 const tasks = new Map<string, ServerDownloadTask>();
 const abortControllers = new Map<string, AbortController>();
-/** 当前正在跑的 ffmpeg，用于暂停（SIGSTOP）/继续（SIGCONT） */
-const runningProcs = new Map<string, ChildProcess>();
+/** 当前正在跑的 ffmpeg（同任务可多路），用于暂停（SIGSTOP）/继续（SIGCONT） */
+const runningProcs = new Map<string, Set<ChildProcess>>();
 let activeCount = 0;
+
+function trackProc(taskId: string, child: ChildProcess): void {
+  let set = runningProcs.get(taskId);
+  if (!set) {
+    set = new Set();
+    runningProcs.set(taskId, set);
+  }
+  set.add(child);
+}
+
+function untrackProc(taskId: string, child: ChildProcess): void {
+  const set = runningProcs.get(taskId);
+  if (!set) return;
+  set.delete(child);
+  if (set.size === 0) runningProcs.delete(taskId);
+}
+
+function signalTaskProcs(taskId: string, sig: NodeJS.Signals): number {
+  const set = runningProcs.get(taskId);
+  if (!set?.size) return 0;
+  let n = 0;
+  for (const proc of set) {
+    if (!proc.pid) continue;
+    try {
+      process.kill(proc.pid, sig);
+      n += 1;
+    } catch {
+      /* ignore dead pid */
+    }
+  }
+  return n;
+}
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 let loaded = false;
 
@@ -190,22 +230,92 @@ function resolveBaseDir(kind: MediaKind, targetDir?: string): string {
   return kind === 'tv' ? path.resolve(TV_DIR) : path.resolve(MOVIES_DIR);
 }
 
+/** 中文数字季 → 阿拉伯数字（支持 1–99 常用写法） */
+function chineseSeasonToNumber(raw: string): number | null {
+  const digits = '零一二三四五六七八九';
+  const value = raw.replace(/两/g, '二').trim();
+  if (/^\d+$/.test(value)) {
+    const n = parseInt(value, 10);
+    return n > 0 ? n : null;
+  }
+  if (/^[一二三四五六七八九]$/u.test(value)) return digits.indexOf(value);
+  if (/^[一二三四五六七八九]?十[一二三四五六七八九]?$/u.test(value)) {
+    const [tens, units] = value.split('十');
+    return (tens ? digits.indexOf(tens) : 1) * 10 + (units ? digits.indexOf(units) : 0);
+  }
+  return null;
+}
+
+/** 从剧名解析「第N季 / Season N / S02」；返回去掉季后缀的剧名 */
+export function parseShowSeason(title: string): { base: string; season?: number } {
+  const t = title.trim();
+  const patterns: RegExp[] = [
+    /^(.*?)\s*第\s*([0-9]+|[一二两三四五六七八九十]{1,3})\s*季\s*$/u,
+    /^(.*?)\s*第\s*([0-9]+|[一二两三四五六七八九十]{1,3})\s*季\b/u,
+    /^(.*?)\s*[\(\[（【]?\s*Season\s*0*([1-9]\d*)\s*[\)\]）】]?\s*$/i,
+    /^(.*?)\s+S0*([1-9]\d*)\s*$/i,
+  ];
+  for (const re of patterns) {
+    const m = t.match(re);
+    if (!m?.[1]?.trim()) continue;
+    const season = /^\d+$/.test(m[2]) ? parseInt(m[2], 10) : chineseSeasonToNumber(m[2]);
+    if (season && season > 0) return { base: m[1].trim(), season };
+  }
+  return { base: t };
+}
+
+/** 从集标题解析 S01E02 / 1x02 */
+function parseEpisodeCode(text: string | undefined): { season: number; episode: number } | null {
+  if (!text) return null;
+  const m =
+    text.match(/\bS(\d{1,2})\s*[EExx](\d{1,3})\b/i) ||
+    text.match(/\b(\d{1,2})x(\d{1,3})\b/i);
+  if (!m) return null;
+  const season = parseInt(m[1], 10);
+  const episode = parseInt(m[2], 10);
+  if (season > 0 && episode > 0) return { season, episode };
+  return null;
+}
+
+function formatSxxExx(season: number, episode: number): string {
+  return `S${String(season).padStart(2, '0')}E${String(episode).padStart(2, '0')}`;
+}
+
+/**
+ * Emby 友好路径：
+ * - 电影：`{base}/{剧名}.mp4`
+ * - 剧集：`{base}/{剧名}/Season {N}/{剧名} SxxExx.mp4`
+ * 若用户已选中剧名目录（basename==剧名），不再套一层。
+ */
 function buildOutputPath(
   kind: MediaKind,
   title: string,
   episode: number | undefined,
   episodeTitle: string | undefined,
-  baseDir: string
+  baseDir: string,
+  seasonHint?: number
 ): string {
-  const safe = sanitizeFilename(title);
   if (kind === 'movie') {
+    const safe = sanitizeFilename(title);
     return path.join(baseDir, `${safe}.mp4`);
   }
-  const showDir = path.join(baseDir, safe);
-  const epNum = episode && episode > 0 ? episode : 1;
-  const epLabel = `E${String(epNum).padStart(2, '0')}`;
-  const epName = episodeTitle ? sanitizeFilename(episodeTitle) : `${safe} - ${epLabel}`;
-  return path.join(showDir, `${epName}.mp4`);
+
+  const parsed = parseShowSeason(title);
+  const fromCode = parseEpisodeCode(episodeTitle);
+  const show = sanitizeFilename(parsed.base || title);
+  const season =
+    (seasonHint && seasonHint > 0 ? seasonHint : undefined) ||
+    fromCode?.season ||
+    parsed.season ||
+    1;
+  const epNum = fromCode?.episode || (episode && episode > 0 ? episode : 1);
+  const code = formatSxxExx(season, epNum);
+
+  const baseResolved = path.resolve(baseDir);
+  const showDir =
+    path.basename(baseResolved) === show ? baseResolved : path.join(baseResolved, show);
+  const seasonDir = path.join(showDir, `Season ${season}`);
+  return path.join(seasonDir, `${show} ${code}.mp4`);
 }
 
 async function assertUrlAllowed(url: string): Promise<void> {
@@ -291,13 +401,18 @@ function runFfmpegOnce(
       '-loglevel', 'error',
       '-stats',
       ...(isLocalList
-        ? ['-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data']
+        ? [
+            '-protocol_whitelist', 'file,http,https,tcp,tls,crypto,data',
+            // HLS 多分片并行拉取（单集吞吐；剧集另有 EPISODE_CONCURRENCY）
+            '-http_multiple', '1',
+          ]
         : [
             '-user_agent', UA,
             '-reconnect', '1',
             '-reconnect_streamed', '1',
             '-reconnect_delay_max', '30',
             '-timeout', '30000000',
+            '-http_multiple', '1',
           ]),
       '-i', input,
       '-c', 'copy',
@@ -313,7 +428,7 @@ function runFfmpegOnce(
       reject(err instanceof Error ? err : new Error(String(err)));
       return;
     }
-    runningProcs.set(taskId, child);
+    trackProc(taskId, child);
 
     let errBuf = '';
     const onAbort = () => {
@@ -323,7 +438,7 @@ function runFfmpegOnce(
     };
     if (signal.aborted) {
       onAbort();
-      runningProcs.delete(taskId);
+      untrackProc(taskId, child);
       reject(new Error('已取消'));
       return;
     }
@@ -338,13 +453,13 @@ function runFfmpegOnce(
 
     child.on('error', (err) => {
       signal.removeEventListener('abort', onAbort);
-      runningProcs.delete(taskId);
+      untrackProc(taskId, child);
       reject(new Error(`无法启动 ffmpeg：${err.message}`));
     });
 
     child.on('close', (code) => {
       signal.removeEventListener('abort', onAbort);
-      runningProcs.delete(taskId);
+      untrackProc(taskId, child);
       if (signal.aborted) {
         reject(new Error('已取消'));
         return;
@@ -420,6 +535,89 @@ async function downloadEpisodeFile(
   }
 }
 
+function refreshTaskProgress(task: ServerDownloadTask): void {
+  const total = task.episodes.length || 1;
+  const sumPct = task.episodes.reduce((s, e) => s + Math.min(100, Math.max(0, e.progress || 0)), 0);
+  const done = task.episodes.filter((e) => e.status === 'completed').length;
+  const active = task.episodes.filter((e) => e.status === 'downloading').length;
+  const overall = Math.min(99, Math.round(sumPct / total));
+  touch(task, {
+    status: task.status === 'paused' ? 'paused' : 'downloading',
+    progress: overall,
+    message:
+      active > 0
+        ? `并行 ${active} 路 · 已完成 ${done}/${total}`
+        : `已完成 ${done}/${total}`,
+  });
+}
+
+/** 有限并发跑集数；单集失败不拖垮全剧（取消除外） */
+async function runEpisodesPool(
+  task: ServerDownloadTask,
+  signal: AbortSignal,
+  indices: number[]
+): Promise<void> {
+  const total = task.episodes.length;
+  let cursor = 0;
+  let cancelledErr: unknown;
+
+  const worker = async () => {
+    while (true) {
+      if (signal.aborted) throw new Error('已取消');
+      const my = cursor++;
+      if (my >= indices.length) return;
+      const i = indices[my];
+      const ep = task.episodes[i];
+
+      ep.status = 'downloading';
+      ep.progress = 0;
+      ep.message = '下载中';
+      refreshTaskProgress(task);
+
+      try {
+        const adFilter = await downloadEpisodeFile(
+          task.id,
+          ep.url,
+          ep.outputPath!,
+          signal,
+          (pct) => {
+            if (task.status === 'paused') return;
+            ep.progress = pct;
+            refreshTaskProgress(task);
+          },
+          (info) => {
+            ep.adFilter = info;
+            ep.message = info.label;
+            refreshTaskProgress(task);
+          }
+        );
+        ep.adFilter = adFilter;
+        ep.status = 'completed';
+        ep.progress = 100;
+        ep.message = adFilter.label;
+        refreshTaskProgress(task);
+      } catch (err) {
+        ep.status = signal.aborted ? 'cancelled' : 'error';
+        ep.message = err instanceof Error ? err.message : String(err);
+        touch(task);
+        if (signal.aborted) {
+          cancelledErr = err;
+          throw err;
+        }
+        if (total === 1) throw err;
+      }
+    }
+  };
+
+  const n = Math.min(EPISODE_CONCURRENCY, indices.length);
+  const results = await Promise.allSettled(Array.from({ length: n }, () => worker()));
+  if (signal.aborted || cancelledErr) throw cancelledErr instanceof Error ? cancelledErr : new Error('已取消');
+  const hard = results.find(
+    (r) => r.status === 'rejected' && !(r.reason instanceof Error && r.reason.message === '已取消')
+  );
+  if (total === 1 && hard && hard.status === 'rejected') throw hard.reason;
+}
+
 async function runTask(task: ServerDownloadTask): Promise<void> {
   const ac = abortControllers.get(task.id);
   if (!ac) return;
@@ -427,64 +625,21 @@ async function runTask(task: ServerDownloadTask): Promise<void> {
   touch(task, { status: 'downloading', message: '下载中', progress: 0 });
 
   const total = task.episodes.length;
-  let done = 0;
 
   try {
+    const pending: number[] = [];
     for (let i = 0; i < task.episodes.length; i++) {
-      if (signal.aborted) throw new Error('已取消');
       const ep = task.episodes[i];
       if (ep.status === 'completed' && ep.outputPath && fs.existsSync(ep.outputPath)) {
-        done += 1;
+        ep.progress = 100;
         continue;
       }
-      ep.status = 'downloading';
-      ep.progress = 0;
-      ep.message = '下载中';
-      touch(task);
+      pending.push(i);
+    }
+    refreshTaskProgress(task);
 
-      const out = ep.outputPath!;
-      try {
-        const adFilter = await downloadEpisodeFile(
-          task.id,
-          ep.url,
-          out,
-          signal,
-          (pct) => {
-            // 暂停期间仍可能收到进度，但 UI 状态以 paused 为准
-            if (task.status === 'paused') return;
-            ep.progress = pct;
-            const overall = Math.round(((done + pct / 100) / total) * 100);
-            touch(task, {
-              progress: Math.min(99, overall),
-              message: `第 ${i + 1}/${total} 集 ${pct}% · ${ep.adFilter?.label || '去广告处理中'}`,
-            });
-          },
-          (info) => {
-            ep.adFilter = info;
-            ep.message = info.label;
-            touch(task, {
-              message: `第 ${i + 1}/${total} 集 · ${info.label}`,
-            });
-          }
-        );
-        ep.adFilter = adFilter;
-        ep.status = 'completed';
-        ep.progress = 100;
-        ep.message = adFilter.label;
-        done += 1;
-        touch(task, {
-          status: 'downloading',
-          progress: Math.round((done / total) * 100),
-          message: `已完成 ${done}/${total}`,
-        });
-      } catch (err) {
-        ep.status = signal.aborted ? 'cancelled' : 'error';
-        ep.message = err instanceof Error ? err.message : String(err);
-        touch(task);
-        // 全剧：单集失败继续下一集，最后汇总
-        if (signal.aborted) throw err;
-        if (total === 1) throw err;
-      }
+    if (pending.length) {
+      await runEpisodesPool(task, signal, pending);
     }
 
     const failed = task.episodes.filter((e) => e.status === 'error').length;
@@ -507,15 +662,45 @@ async function runTask(task: ServerDownloadTask): Promise<void> {
             status: 'none',
             label: '未检测到可识别广告标记（可能仍有残留）',
           };
+    // 剧集：任务路径指到剧名目录（…/Show），不是 Season 子目录
+    const firstOut = task.episodes.find((e) => e.outputPath)?.outputPath || '';
+    const outputPath =
+      task.kind === 'movie'
+        ? task.episodes[0]?.outputPath
+        : firstOut
+          ? path.dirname(path.dirname(firstOut))
+          : undefined;
+    const baseMsg = failed
+      ? `完成 ${completed}/${total}（${failed} 集失败）· ${adFilter.label}`
+      : `全部完成 · ${adFilter.label}`;
     touch(task, {
       status: 'completed',
       progress: 100,
       adFilter,
-      message: failed
-        ? `完成 ${completed}/${total}（${failed} 集失败）· ${adFilter.label}`
-        : `全部完成 · ${adFilter.label}`,
-      outputPath: task.kind === 'movie' ? task.episodes[0]?.outputPath : path.dirname(task.episodes[0]?.outputPath || ''),
+      message: baseMsg,
+      outputPath,
     });
+
+    // 下载成功后增量通知 Emby；失败只写提示，不改 completed
+    const paths = task.episodes
+      .filter((e) => e.status === 'completed' && e.outputPath)
+      .map((e) => e.outputPath!);
+    if (task.kind === 'tv' && outputPath) paths.unshift(outputPath);
+    try {
+      const emby = await notifyEmbyMediaUpdated(paths);
+      if (!emby.skipped) {
+        touch(task, {
+          embyNotify: emby,
+          message: `${baseMsg} · ${emby.message}`,
+        });
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      touch(task, {
+        embyNotify: { ok: false, message: `Emby 刷新失败：${msg.slice(0, 120)}` },
+        message: `${baseMsg} · Emby 刷新失败`,
+      });
+    }
   } catch (err) {
     if (signal.aborted || (err instanceof Error && err.message === '已取消')) {
       touch(task, { status: 'cancelled', message: '已取消' });
@@ -548,19 +733,12 @@ function schedulePump(): void {
   }
 }
 
-/** 暂停：SIGSTOP 挂起 ffmpeg，任务状态标 paused */
+/** 暂停：SIGSTOP 挂起该任务下全部 ffmpeg */
 export function pauseServerDownload(id: string): boolean {
   ensureLoaded();
   const task = tasks.get(id);
   if (!task || task.status !== 'downloading') return false;
-  const proc = runningProcs.get(id);
-  if (proc?.pid) {
-    try {
-      process.kill(proc.pid, 'SIGSTOP');
-    } catch {
-      return false;
-    }
-  }
+  signalTaskProcs(id, 'SIGSTOP');
   touch(task, { status: 'paused', message: '已暂停' });
   for (const ep of task.episodes) {
     if (ep.status === 'downloading') ep.message = '已暂停';
@@ -568,25 +746,23 @@ export function pauseServerDownload(id: string): boolean {
   return true;
 }
 
-/** 继续：SIGCONT 恢复 ffmpeg */
+/** 继续：SIGCONT 恢复该任务下全部 ffmpeg */
 export function resumeServerDownload(id: string): boolean {
   ensureLoaded();
   const task = tasks.get(id);
   if (!task || task.status !== 'paused') return false;
-  const proc = runningProcs.get(id);
-  if (proc?.pid) {
-    try {
-      process.kill(proc.pid, 'SIGCONT');
-    } catch {
-      /* 进程已结束则重新排队 */
-      touch(task, { status: 'waiting', message: '重新排队' });
-      if (!abortControllers.has(id)) abortControllers.set(id, new AbortController());
-      schedulePump();
-      return true;
+  const n = signalTaskProcs(id, 'SIGCONT');
+  if (n === 0 && !(runningProcs.get(id)?.size)) {
+    // 无存活进程（暂停卡在探时长/排队）→ 重新排队整任务
+    touch(task, { status: 'waiting', message: '重新排队' });
+    for (const ep of task.episodes) {
+      if (ep.status === 'downloading' || ep.status === 'paused') {
+        ep.status = 'waiting';
+        ep.message = '等待继续';
+      }
     }
-  } else {
-    // 无进程（暂停时还在排队探时长等）→ 回到 downloading/waiting
-    touch(task, { status: 'downloading', message: '继续下载' });
+    if (!abortControllers.has(id)) abortControllers.set(id, new AbortController());
+    schedulePump();
     return true;
   }
   touch(task, { status: 'downloading', message: '继续下载' });
@@ -633,10 +809,19 @@ export async function createServerDownload(input: CreateInput): Promise<ServerDo
     sourceName: input.sourceName,
     episodes: input.episodes.map((ep, idx) => {
       const episode = ep.episode ?? (kind === 'tv' ? idx + 1 : undefined);
-      const outputPath = buildOutputPath(kind, input.title.trim(), episode, ep.title, baseDir);
+      const season = ep.season && ep.season > 0 ? ep.season : undefined;
+      const outputPath = buildOutputPath(
+        kind,
+        input.title.trim(),
+        episode,
+        ep.title,
+        baseDir,
+        season
+      );
       return {
         url: ep.url,
         episode,
+        season,
         title: ep.title,
         status: 'waiting' as ServerDownloadStatus,
         progress: 0,

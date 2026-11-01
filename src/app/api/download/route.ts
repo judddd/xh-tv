@@ -24,9 +24,10 @@ export async function GET(req: Request) {
  * POST：创建下载任务。
  * body: {
  *   title, kind?: 'movie'|'tv', sourceName?, targetDir?,
- *   episodes: [{ url, episode?, title? }]
+ *   episodes: [{ url, episode?, season?, title? }]
  * }
  * 不强制换源：默认用当前播放源的地址；全剧把该源全部集数一次提交即可。
+ * 剧集落盘：{target}/剧名/Season N/剧名 SxxExx.mp4
  */
 export async function POST(req: Request) {
   const guarded = guardRequest(req);
@@ -37,10 +38,11 @@ export async function POST(req: Request) {
     kind?: MediaKind;
     sourceName?: string;
     targetDir?: string;
-    episodes?: Array<{ url?: string; episode?: number; title?: string }>;
+    episodes?: Array<{ url?: string; episode?: number; season?: number; title?: string }>;
     /** 兼容单集快捷字段 */
     url?: string;
     episode?: number;
+    season?: number;
   };
   try {
     body = (await req.json()) as typeof body;
@@ -52,9 +54,12 @@ export async function POST(req: Request) {
     body.episodes?.filter((e) => e?.url)?.map((e) => ({
       url: String(e.url),
       episode: typeof e.episode === 'number' ? e.episode : undefined,
+      season: typeof e.season === 'number' ? e.season : undefined,
       title: e.title ? String(e.title) : undefined,
     })) ??
-    (body.url ? [{ url: String(body.url), episode: body.episode }] : []);
+    (body.url
+      ? [{ url: String(body.url), episode: body.episode, season: body.season }]
+      : []);
 
   try {
     const task = await createServerDownload({

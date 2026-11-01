@@ -137,7 +137,8 @@ export function AggregatedCard({
           episodes: episodes.map((url, i) => ({
             url,
             episode: i + 1,
-            title: `${item.name} - E${String(i + 1).padStart(2, '0')}`,
+            season: 1,
+            title: `${item.name} S01E${String(i + 1).padStart(2, '0')}`,
           })),
         });
       } else {
