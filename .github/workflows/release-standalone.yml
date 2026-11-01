@@ -1,0 +1,192 @@
+name: release-standalone
+
+# 打版本 tag（v*）时，除多架构镜像外再产出一个与 CPU 架构无关的预构建包：
+# 解压后 `node server.js` 即可运行，供 armv7（路由器 / 梅林固件）、无 Docker 的环境使用。
+#
+# 为什么不需要按架构重新构建：运行期依赖全是纯 JS，唯一与架构绑定的是 next 的可选依赖
+# sharp（图片优化用）。本项目 images.unoptimized 且不使用 next/image，打包前剔除即可，
+# 于是同一份产物可以在任意架构的 Node 18+ 上运行。
+#
+# 与 docker-publish 的关系：两者都监听 v* tag，互不依赖；镜像仍按架构在原生 runner 上构建。
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '手动触发时：把产物附加到哪个已存在的 Release tag（如 v2.20.2）；留空则只产出 artifact'
+        required: false
+        type: string
+
+permissions:
+  contents: write # 创建 Release 并上传资产
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      # 拉全量历史与 tag：发版说明要算上一版（git describe）
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci --no-audit --no-fund
+
+      # next.config.ts 只在 DOCKER_BUILD=1 时启用 output: 'standalone'
+      - name: 构建 standalone 产物
+        env:
+          DOCKER_BUILD: '1'
+          NEXT_TELEMETRY_DISABLED: '1'
+        run: npm run build
+
+      - name: 组装可移植包目录
+        working-directory: .next/standalone
+        run: |
+          # standalone 只含 server.js 与按需 trace 的 node_modules，
+          # 静态资源与 public 需按 Dockerfile 的方式补进来
+          cp -r ../../public ./public
+          mkdir -p ./.next
+          cp -r ../static ./.next/static
+
+          # sharp 会把构建机的平台二进制（@img/sharp-linuxmusl-x64）带进产物，
+          # 不剔除的话这个包只能在 x64 上跑，失去跨架构的意义
+          rm -rf node_modules/sharp node_modules/@img
+
+          # next build 会把项目根的 .env* 一并复制进 standalone（本地实测会带 PASSWORD）。
+          # 发布包是公开下载的，绝不能带任何环境文件；删完再兜底校验
+          rm -f .env .env.*
+          if find . -maxdepth 1 -name '.env*' | grep -q .; then
+            echo '::error::产物里仍有 .env 文件，拒绝发布'
+            find . -maxdepth 1 -name '.env*'
+            exit 1
+          fi
+
+          # 兜底校验：只要还有 .node，就说明有原生模块漏了，宁可失败也不要发一个坏包
+          if find . -name '*.node' | grep -q .; then
+            echo '::error::产物里仍有原生模块，跨架构不可用：'
+            find . -name '*.node'
+            exit 1
+          fi
+
+      - name: 冒烟测试
+        working-directory: .next/standalone
+        run: |
+          # 必须重定向输出：后台进程占着 stdout 会让这一步一直挂着不结束
+          PORT=3000 HOSTNAME=127.0.0.1 node server.js > /tmp/standalone.log 2>&1 &
+          SERVER_PID=$!
+          for i in $(seq 1 30); do
+            sleep 1
+            if curl -fsS http://127.0.0.1:3000/api/status > /dev/null; then
+              echo "启动正常（${i}s）"
+              kill "$SERVER_PID"
+              exit 0
+            fi
+          done
+          echo '::error::standalone 包启动失败，不发布'
+          cat /tmp/standalone.log
+          kill "$SERVER_PID" 2> /dev/null || true
+          exit 1
+
+      - name: 打包
+        run: |
+          VER="$(node -p "require('./package.json').version")"
+          mkdir -p dist
+          tar -czf "dist/libretv-${VER}-standalone.tar.gz" -C .next/standalone .
+          (cd dist && sha256sum libretv-*.tar.gz > SHA256SUMS)
+          ls -lh dist
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: standalone-${{ github.ref_name }}
+          path: dist/
+          if-no-files-found: error
+
+      # tag 触发直接挂到该 tag 的 Release；手动触发则在填了 tag 输入时才挂，
+      # 留空只出 artifact（方便先试跑打包链路，不碰任何 Release）
+      - name: 生成发布说明
+        if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG="$GITHUB_REF_NAME"
+          else
+            TAG="$TAG_INPUT"
+          fi
+          if [ -z "$TAG" ]; then
+            echo '::error::手动触发需要填写 tag 输入'; exit 1
+          fi
+          # 只认已存在的 tag：避免 gh 顺手按默认分支新建一个指错提交的 tag
+          if ! git ls-remote --exit-code --tags origin "refs/tags/${TAG}" > /dev/null; then
+            echo "::error::远端没有 tag ${TAG}，请先推送 tag 或检查输入"; exit 1
+          fi
+
+          VER="$(node -p "require('./package.json').version")"
+          if [ "$TAG" != "v${VER}" ]; then
+            echo "::warning::tag ${TAG} 与 package.json 的 ${VER} 不一致，文件仍按 ${VER} 命名"
+          fi
+
+          # 镜像名与 docker-publish 保持一致：GHCR 按仓库全名转小写，Docker Hub 固定
+          GHCR="ghcr.io/${GITHUB_REPOSITORY,,}"
+          HUB="docker.io/bestzwei/libretv"
+          PREV="$(git describe --tags --abbrev=0 "${TAG}^" 2> /dev/null || true)"
+          # 写到 RUNNER_TEMP，不落在工作区（避免本地复现时在仓库里留文件）
+          NOTES="${RUNNER_TEMP}/release-notes.md"
+
+          {
+            echo '## 获取方式'
+            echo
+            echo '### Docker（多架构 linux/amd64 / linux/arm64）'
+            echo
+            echo '```bash'
+            echo "docker pull ${HUB}:${VER}"
+            echo "docker pull ${GHCR}:${VER}"
+            echo '```'
+            echo
+            echo "两个 registry 的镜像内容一致（同一组 digest），\`latest\` 也指向本版本。"
+            echo
+            echo '### 免 Docker（下方附件，Node 18+）'
+            echo
+            echo '```bash'
+            echo "sha256sum -c SHA256SUMS"
+            echo "tar -xzf libretv-${VER}-standalone.tar.gz -C libretv"
+            echo "cd libretv && PASSWORD=your-password PORT=8080 node server.js"
+            echo '```'
+            echo
+            echo '预构建包与 CPU 架构无关（x86_64 / arm64 / armv7），环境变量与 Docker 部署一致。'
+            echo
+            echo '> 镜像由 docker-publish 工作流在同一 tag 上构建，刚发布时可能还要 5–10 分钟才可拉取。'
+            echo
+            echo '## 变更'
+            echo
+            if [ -n "$PREV" ]; then
+              echo "完整对比：https://github.com/${GITHUB_REPOSITORY}/compare/${PREV}...${TAG}"
+            else
+              echo "完整提交：https://github.com/${GITHUB_REPOSITORY}/commits/${TAG}"
+            fi
+          } > "$NOTES"
+
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "NOTES_FILE=$NOTES" >> "$GITHUB_ENV"
+          cat "$NOTES"
+
+      - name: 创建 Release 并上传资产
+        if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 已存在的 Release 只补资产、不覆盖说明（说明可能是人工改过的）
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "::notice::Release $TAG 已存在，只更新附件，说明保持不变"
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file "$NOTES_FILE"
+          fi
+          gh release upload "$TAG" dist/*.tar.gz dist/SHA256SUMS --clobber

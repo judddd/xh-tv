@@ -1,0 +1,361 @@
+'use client';
+
+import { useCallback, useEffect, useState } from 'react';
+import { Drawer } from './drawer';
+import { Icon } from './icon';
+import { useToast } from './toast';
+import { api, ApiError } from '@/lib/client-api';
+import type { MediaKind, ServerDownloadTask } from '@/lib/server-download-types';
+import { DownloadFolderPicker, type DownloadFolderChoice } from './download-folder-picker';
+
+/**
+ * 服务端下载管理器：
+ * - 播放页 / 来源列表触发入队前先弹目录选择（默认 Movies/TVShows，可改）；
+ * - ffmpeg 落盘；支持暂停 / 继续 / 取消 / 重试。
+ */
+
+const ADD_TASK_EVENT = 'libretv:add-download';
+const ADD_SERIES_EVENT = 'libretv:add-series-download';
+const SHOW_MANAGER_EVENT = 'libretv:show-download-manager';
+export const DOWNLOADS_UPDATED_EVENT = 'libretv:downloads-updated';
+
+export interface AddDownloadPayload {
+  url: string;
+  title: string;
+  kind?: MediaKind;
+  episode?: number;
+  sourceName?: string;
+  targetDir?: string;
+  /** 若未带 targetDir，弹窗选择；skipPicker=true 时用默认目录 */
+  skipPicker?: boolean;
+  format?: 'TS' | 'MP4';
+}
+
+export interface AddSeriesDownloadPayload {
+  title: string;
+  kind?: MediaKind;
+  sourceName?: string;
+  targetDir?: string;
+  skipPicker?: boolean;
+  episodes: Array<{ url: string; episode?: number; title?: string }>;
+}
+
+type Pending =
+  | { type: 'episode'; payload: AddDownloadPayload }
+  | { type: 'series'; payload: AddSeriesDownloadPayload };
+
+export function DownloadManager({ isOpen, onClose }: { isOpen: boolean; onClose: () => void }) {
+  const { toast } = useToast();
+  const [tasks, setTasks] = useState<ServerDownloadTask[]>([]);
+  const [roots, setRoots] = useState<{ movies: string; tv: string } | null>(null);
+  const [pending, setPending] = useState<Pending | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      const data = await api.downloadList();
+      setTasks(data.tasks);
+      setRoots(data.roots);
+      window.dispatchEvent(new CustomEvent(DOWNLOADS_UPDATED_EVENT));
+    } catch (err) {
+      if (err instanceof ApiError && (err.status === 401 || err.status === 503)) return;
+    }
+  }, []);
+
+  const submitEpisode = useCallback(
+    async (payload: AddDownloadPayload, choice?: DownloadFolderChoice) => {
+      const kind = choice?.kind ?? payload.kind ?? 'movie';
+      const targetDir =
+        choice?.targetDir ??
+        payload.targetDir ??
+        (kind === 'tv' ? roots?.tv : roots?.movies);
+      const epTitle =
+        kind === 'tv' && payload.episode
+          ? `${payload.title} - E${String(payload.episode).padStart(2, '0')}`
+          : undefined;
+      await api.downloadCreate({
+        title: payload.title,
+        kind,
+        sourceName: payload.sourceName,
+        targetDir,
+        episodes: [{ url: payload.url, episode: payload.episode, title: epTitle }],
+      });
+      toast(`《${payload.title}》已加入下载`, 'success');
+      await refresh();
+      window.dispatchEvent(new CustomEvent(SHOW_MANAGER_EVENT));
+    },
+    [refresh, roots, toast]
+  );
+
+  const submitSeries = useCallback(
+    async (payload: AddSeriesDownloadPayload, choice?: DownloadFolderChoice) => {
+      const kind = choice?.kind ?? payload.kind ?? 'tv';
+      const targetDir = choice?.targetDir ?? payload.targetDir ?? roots?.tv;
+      let episodes = payload.episodes;
+      if (choice?.scope === 'episode') {
+        episodes = episodes.slice(0, 1);
+      }
+      await api.downloadCreate({
+        title: payload.title,
+        kind,
+        sourceName: payload.sourceName,
+        targetDir,
+        episodes,
+      });
+      toast(
+        choice?.scope === 'episode'
+          ? `《${payload.title}》第 1 集已加入下载`
+          : `《${payload.title}》全剧 ${episodes.length} 集已加入下载`,
+        'success'
+      );
+      await refresh();
+      window.dispatchEvent(new CustomEvent(SHOW_MANAGER_EVENT));
+    },
+    [refresh, roots, toast]
+  );
+
+  useEffect(() => {
+    const onAdd = (e: Event) => {
+      const detail = (e as CustomEvent<AddDownloadPayload>).detail;
+      if (!detail?.url || !detail?.title) return;
+      void (async () => {
+        try {
+          if (detail.targetDir || detail.skipPicker) {
+            await submitEpisode(detail);
+            return;
+          }
+          setPending({ type: 'episode', payload: detail });
+        } catch (err) {
+          toast(err instanceof Error ? err.message : '入队失败', 'error');
+        }
+      })();
+    };
+
+    const onSeries = (e: Event) => {
+      const detail = (e as CustomEvent<AddSeriesDownloadPayload>).detail;
+      if (!detail?.title || !detail.episodes?.length) return;
+      void (async () => {
+        try {
+          if (detail.targetDir || detail.skipPicker) {
+            await submitSeries(detail);
+            return;
+          }
+          setPending({ type: 'series', payload: detail });
+        } catch (err) {
+          toast(err instanceof Error ? err.message : '入队失败', 'error');
+        }
+      })();
+    };
+
+    window.addEventListener(ADD_TASK_EVENT, onAdd);
+    window.addEventListener(ADD_SERIES_EVENT, onSeries);
+    return () => {
+      window.removeEventListener(ADD_TASK_EVENT, onAdd);
+      window.removeEventListener(ADD_SERIES_EVENT, onSeries);
+    };
+  }, [submitEpisode, submitSeries, toast]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    void refresh();
+    const timer = setInterval(() => void refresh(), 2000);
+    return () => clearInterval(timer);
+  }, [isOpen, refresh]);
+
+  // 有待选目录时也预拉一次 roots
+  useEffect(() => {
+    if (!pending || roots) return;
+    void api.downloadList().then((d) => setRoots(d.roots)).catch(() => {});
+  }, [pending, roots]);
+
+  const onPickerConfirm = async (choice: DownloadFolderChoice) => {
+    if (!pending) return;
+    const cur = pending;
+    setPending(null);
+    try {
+      if (cur.type === 'episode') await submitEpisode(cur.payload, choice);
+      else await submitSeries(cur.payload, choice);
+    } catch (err) {
+      toast(err instanceof Error ? err.message : '入队失败', 'error');
+    }
+  };
+
+  const onCancel = async (task: ServerDownloadTask) => {
+    try {
+      if (task.status === 'downloading' || task.status === 'waiting' || task.status === 'paused') {
+        await api.downloadCancel(task.id);
+        toast(`《${task.title}》已取消`, 'info');
+      } else {
+        await api.downloadRemove(task.id);
+        toast(`《${task.title}》已删除记录`, 'info');
+      }
+      await refresh();
+    } catch (err) {
+      toast(err instanceof Error ? err.message : '操作失败', 'error');
+    }
+  };
+
+  const onPauseResume = async (task: ServerDownloadTask) => {
+    try {
+      if (task.status === 'downloading') {
+        await api.downloadPause(task.id);
+        toast(`《${task.title}》已暂停`, 'info');
+      } else if (task.status === 'paused') {
+        await api.downloadResume(task.id);
+        toast(`《${task.title}》继续下载`, 'success');
+      }
+      await refresh();
+    } catch (err) {
+      toast(err instanceof Error ? err.message : '操作失败', 'error');
+    }
+  };
+
+  const onRetry = async (task: ServerDownloadTask) => {
+    try {
+      await api.downloadRetry(task.id);
+      toast(`《${task.title}》已重新排队`, 'success');
+      await refresh();
+    } catch (err) {
+      toast(err instanceof Error ? err.message : '重试失败', 'error');
+    }
+  };
+
+  const statusLabel: Record<ServerDownloadTask['status'], string> = {
+    waiting: '排队中',
+    downloading: '下载中',
+    paused: '已暂停',
+    completed: '已完成',
+    error: '失败',
+    cancelled: '已取消',
+  };
+
+  const pickerDefaultKind: MediaKind =
+    pending?.type === 'series'
+      ? pending.payload.kind ?? 'tv'
+      : pending?.payload.kind ?? 'movie';
+
+  return (
+    <>
+      <DownloadFolderPicker
+        open={Boolean(pending)}
+        title={pending?.payload.title || ''}
+        defaultKind={pickerDefaultKind}
+        allowSeries={pending?.type === 'series' && (pending.payload.episodes?.length || 0) > 1}
+        episodeCount={pending?.type === 'series' ? pending.payload.episodes.length : 1}
+        onClose={() => setPending(null)}
+        onConfirm={(c) => void onPickerConfirm(c)}
+      />
+
+      <Drawer open={isOpen} onClose={onClose} title="下载管理" width="max-w-lg">
+        <div className="space-y-3">
+          <div className="card p-3 space-y-1">
+            <p className="text-sm text-content">服务端 ffmpeg 落盘（可暂停，可选手动目录）</p>
+            <p className="text-xs text-faint">
+              默认电影 → {roots?.movies || '/media/Movies'}
+              <br />
+              默认剧集 → {roots?.tv || '/media/TVShows'}
+              <br />
+              每次下载都会弹出目录选择；也可浏览 / 新建其它允许文件夹。
+            </p>
+          </div>
+
+          {tasks.length === 0 && (
+            <div className="py-10 text-center text-sm text-faint">
+              暂无下载任务。在来源列表或播放页点击下载。
+            </div>
+          )}
+
+          {tasks.map((t) => (
+            <div key={t.id} className="card p-3 space-y-2">
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <p className="text-sm text-content truncate">{t.title}</p>
+                  <p className="text-xs text-faint">
+                    {t.kind === 'tv' ? '剧集' : '电影'} · {statusLabel[t.status]}
+                    {t.sourceName ? ` · ${t.sourceName}` : ''}
+                    {t.episodes.length > 1
+                      ? ` · ${t.episodes.filter((e) => e.status === 'completed').length}/${t.episodes.length} 集`
+                      : ''}
+                  </p>
+                  {t.message && <p className="text-xs text-muted mt-0.5 break-all">{t.message}</p>}
+                  {t.outputPath && t.status === 'completed' && (
+                    <p className="text-xs text-faint mt-0.5 break-all">{t.outputPath}</p>
+                  )}
+                </div>
+                <div className="flex items-center gap-1 shrink-0">
+                  {t.status === 'downloading' && (
+                    <button
+                      type="button"
+                      className="px-2 py-1 rounded bg-chip hover:bg-hover text-xs text-content transition-colors"
+                      onClick={() => void onPauseResume(t)}
+                    >
+                      暂停
+                    </button>
+                  )}
+                  {t.status === 'paused' && (
+                    <button
+                      type="button"
+                      className="px-2 py-1 rounded bg-chip hover:bg-hover text-xs text-content transition-colors"
+                      onClick={() => void onPauseResume(t)}
+                    >
+                      继续
+                    </button>
+                  )}
+                  {(t.status === 'error' || t.status === 'cancelled') && (
+                    <button
+                      type="button"
+                      className="px-2 py-1 rounded bg-chip hover:bg-hover text-xs text-content transition-colors"
+                      onClick={() => void onRetry(t)}
+                    >
+                      重试
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    aria-label="删除或取消下载任务"
+                    className="p-1.5 rounded bg-chip hover:bg-hover text-content transition-colors"
+                    onClick={() => void onCancel(t)}
+                  >
+                    <Icon name="close" className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+              {(t.status === 'downloading' ||
+                t.status === 'paused' ||
+                t.status === 'waiting' ||
+                t.status === 'completed') && (
+                <div className="h-1.5 rounded-full bg-chip overflow-hidden">
+                  <div
+                    className="h-full bg-accent transition-all"
+                    style={{ width: `${Math.min(100, Math.max(0, t.progress))}%` }}
+                  />
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </Drawer>
+    </>
+  );
+}
+
+export function enqueueDownload(payload: AddDownloadPayload): void {
+  window.dispatchEvent(new CustomEvent(ADD_TASK_EVENT, { detail: payload }));
+}
+
+export function enqueueSeriesDownload(payload: AddSeriesDownloadPayload): void {
+  window.dispatchEvent(new CustomEvent(ADD_SERIES_EVENT, { detail: payload }));
+}
+
+export function requestShowDownloadManager(): void {
+  window.dispatchEvent(new CustomEvent(SHOW_MANAGER_EVENT));
+}
+
+export function GlobalDownloadManager() {
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    const onShow = () => setOpen(true);
+    window.addEventListener(SHOW_MANAGER_EVENT, onShow);
+    return () => window.removeEventListener(SHOW_MANAGER_EVENT, onShow);
+  }, []);
+  return <DownloadManager isOpen={open} onClose={() => setOpen(false)} />;
+}

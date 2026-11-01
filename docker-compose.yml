@@ -1,0 +1,24 @@
+services:
+  libretv:
+    build: .
+    image: libretv-local:download
+    container_name: libretv
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - PASSWORD=${PASSWORD:?请在 .env 中设置 PASSWORD}
+      - 'DEFAULT_SOURCES=[{"name":"非凡资源","url":"https://cj.ffzyapi.com/api.php/provide/vod/"},{"name":"量子资源","url":"https://cj.lziapi.com/api.php/provide/vod/"},{"name":"红海资源","url":"https://hhzyapi.com/api.php/provide/vod/"},{"name":"红牛资源","url":"https://www.hongniuzy2.com/api.php/provide/vod/"},{"name":"极速资源","url":"https://jszyapi.com/api.php/provide/vod/"},{"name":"金鹰资源","url":"https://jyzyapi.com/api.php/provide/vod/"},{"name":"魔都资源","url":"https://www.mdzyapi.com/api.php/provide/vod/"},{"name":"暴风资源","url":"https://bfzyapi.com/api.php/provide/vod/"},{"name":"虎牙资源","url":"https://www.huyaapi.com/api.php/provide/vod/"},{"name":"光速资源","url":"https://api.guangsuapi.com/api.php/provide/vod/"},{"name":"速播资源","url":"https://subocaiji.com/api.php/provide/vod/"},{"name":"电影天堂","url":"https://caiji.dyttzyapi.com/api.php/provide/vod/"},{"name":"百度资源","url":"https://api.apibdzy.com/api.php/provide/vod/"},{"name":"最大资源","url":"https://api.zuidapi.com/api.php/provide/vod/"}]'
+      - REQUEST_TIMEOUT=30000
+      - MAX_RETRIES=3
+      - SEARCH_MAX_PAGES=3
+      - SEARCH_SOURCE_TIMEOUT_MS=20000
+      - DOWNLOAD_MOVIES_DIR=/media/Movies
+      - DOWNLOAD_TV_DIR=/media/TVShows
+      - DOWNLOAD_ALLOW_ROOTS=/media
+      - DOWNLOAD_STATE_FILE=/data/state/downloads.json
+      - DOWNLOAD_CONCURRENCY=2
+      - DOWNLOAD_RETRIES=3
+    volumes:
+      - "${MEDIA_ROOT:-/Volumes/extend/大眼橙}:/media"
+      - ./download-state:/data/state
