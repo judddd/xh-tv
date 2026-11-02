@@ -29,9 +29,31 @@ interface Props {
   onClose: () => void;
 }
 
+/** 与服务端 sanitizeFilename 对齐，供剧名目录建议 */
+function sanitizeFolderName(name: string): string {
+  return (
+    name
+      .replace(/[\/\\?%*:|"<>]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 120) || 'untitled'
+  );
+}
+
+/** 去掉「第N季 / Season N」后的剧名，作为默认文件夹名 */
+function suggestShowFolderName(rawTitle: string): string {
+  const t = rawTitle
+    .trim()
+    .replace(/\s*第\s*[0-9一二两三四五六七八九十]+\s*季.*$/u, '')
+    .replace(/\s*[\(\[（【]?\s*Season\s*\d+\s*[\)\]）】]?\s*$/i, '')
+    .replace(/\s+S\d{1,2}\s*$/i, '')
+    .trim();
+  return sanitizeFolderName(t || rawTitle);
+}
+
 /**
  * 下载前选目录弹窗：
- * - 默认 Movies / TVShows；
+ * - 剧集默认进入「当前剧名」文件夹（没有则自动创建），电影默认 Movies；
  * - 可浏览允许根下任意子文件夹，也可手输路径、新建文件夹；
  * - 多集时可「全剧」或指定起止集。
  */
@@ -59,34 +81,101 @@ export function DownloadFolderPicker({
   const [newFolder, setNewFolder] = useState('');
   const [loading, setLoading] = useState(false);
 
-  const load = useCallback(async (path?: string | null) => {
-    setLoading(true);
-    try {
-      const data = await api.downloadBrowse(path || undefined);
+  const showFolderName = suggestShowFolderName(title);
+
+  const applyBrowse = useCallback(
+    (data: Awaited<ReturnType<typeof api.downloadBrowse>>, pathValue?: string | null) => {
       setRoots(data.roots);
       setCurrent(data.current);
       setParent(data.parent);
       setDirs(data.dirs);
-      if (!path) {
-        const def = defaultKind === 'tv' ? data.roots.tv : data.roots.movies;
-        setCustomPath(def);
-        setCurrent(def);
-        const inner = await api.downloadBrowse(def);
-        setCurrent(inner.current);
-        setParent(inner.parent);
-        setDirs(inner.dirs);
-        setCustomPath(inner.current || def);
-      } else if (data.current) {
-        setCustomPath(data.current);
-      }
-    } catch (err) {
-      if (!(err instanceof ApiError && (err.status === 401 || err.status === 503))) {
-        toast(err instanceof Error ? err.message : '浏览目录失败', 'error');
-      }
-    } finally {
-      setLoading(false);
+      if (pathValue) setCustomPath(pathValue);
+      else if (data.current) setCustomPath(data.current);
+    },
+    []
+  );
+
+  /** 浏览指定路径；不存在则返回 null */
+  const tryBrowse = useCallback(async (path: string) => {
+    try {
+      return await api.downloadBrowse(path);
+    } catch {
+      return null;
     }
-  }, [defaultKind, toast]);
+  }, []);
+
+  /**
+   * 定位到默认保存位置：
+   * - 剧集：TVShows/<当前剧名>（没有则 mkdir）
+   * - 电影：Movies
+   */
+  const goKindDefault = useCallback(
+    async (nextKind: MediaKind, showName: string) => {
+      setLoading(true);
+      try {
+        const rootData = await api.downloadBrowse();
+        setRoots(rootData.roots);
+        const base = nextKind === 'tv' ? rootData.roots.tv : rootData.roots.movies;
+
+        if (nextKind === 'movie') {
+          const movies = await api.downloadBrowse(base);
+          applyBrowse(movies, movies.current || base);
+          setNewFolder('');
+          return;
+        }
+
+        // 剧集：优先进入与当前剧名同名的文件夹
+        const safe = showName || 'untitled';
+        const existing = (await tryBrowse(base))?.dirs?.find((d) => d.name === safe);
+        if (existing) {
+          const inner = await api.downloadBrowse(existing.path);
+          applyBrowse(inner, inner.current || existing.path);
+          setNewFolder('');
+          return;
+        }
+        // 没有则自动创建，避免每次手填 / 误选别的剧文件夹
+        try {
+          const created = await api.downloadMkdir(base, safe);
+          const inner = await api.downloadBrowse(created.path);
+          applyBrowse(inner, inner.current || created.path);
+          setNewFolder('');
+        } catch {
+          const fallback = await api.downloadBrowse(base);
+          applyBrowse(fallback, fallback.current || base);
+          setNewFolder(safe);
+          toast(`已定位到剧集目录，可新建「${safe}」文件夹`, 'info');
+        }
+      } catch (err) {
+        if (!(err instanceof ApiError && (err.status === 401 || err.status === 503))) {
+          toast(err instanceof Error ? err.message : '浏览目录失败', 'error');
+        }
+      } finally {
+        setLoading(false);
+      }
+    },
+    [applyBrowse, tryBrowse, toast]
+  );
+
+  const load = useCallback(
+    async (path?: string | null) => {
+      setLoading(true);
+      try {
+        if (!path) {
+          await goKindDefault(defaultKind, showFolderName);
+          return;
+        }
+        const data = await api.downloadBrowse(path);
+        applyBrowse(data, data.current || path);
+      } catch (err) {
+        if (!(err instanceof ApiError && (err.status === 401 || err.status === 503))) {
+          toast(err instanceof Error ? err.message : '浏览目录失败', 'error');
+        }
+      } finally {
+        setLoading(false);
+      }
+    },
+    [applyBrowse, defaultKind, goKindDefault, showFolderName, toast]
+  );
 
   useEffect(() => {
     if (!open) return;
@@ -94,8 +183,8 @@ export function DownloadFolderPicker({
     setScope(allowSeries ? 'all' : 'range');
     setEpFrom(1);
     setEpTo(Math.max(1, episodeCount));
-    void load(null);
-  }, [open, defaultKind, allowSeries, episodeCount, load]);
+    void goKindDefault(defaultKind, showFolderName);
+  }, [open, defaultKind, allowSeries, episodeCount, showFolderName, goKindDefault]);
 
   useEffect(() => {
     if (!open) return;
@@ -110,8 +199,7 @@ export function DownloadFolderPicker({
 
   const applyKindDefault = (next: MediaKind) => {
     setKind(next);
-    const def = next === 'tv' ? roots?.tv : roots?.movies;
-    if (def) void load(def);
+    void goKindDefault(next, showFolderName);
   };
 
   const clampRange = () => {
@@ -256,7 +344,15 @@ export function DownloadFolderPicker({
 
           <p className="text-[11px] text-faint leading-relaxed">
             下载时自动按源站广告标记（如 adjump / 可识别中插段）剔除；无标记的源会提示「可能仍有残留」，不事后裁切正片。
-            剧集落盘为 Emby 结构：剧名/Season N/剧名 SxxExx.mp4（请选 TVShows 根目录；选到剧名/Season 也会自动归一，避免套娃）。
+            {kind === 'tv' ? (
+              <>
+                {' '}
+                已按当前片名自动定位到文件夹「{showFolderName}」；落盘为 Emby 结构：
+                {showFolderName}/Season N/{showFolderName} SxxExx.mp4。
+              </>
+            ) : (
+              <> 电影默认保存到 Movies，文件名为「{showFolderName}.mp4」。</>
+            )}
           </p>
 
           <div>
@@ -265,11 +361,17 @@ export function DownloadFolderPicker({
               className="w-full rounded-lg border border-line bg-chip px-3 py-2 text-sm text-content"
               value={customPath}
               onChange={(e) => setCustomPath(e.target.value)}
-              placeholder="/media/Movies"
+              placeholder={
+                kind === 'tv'
+                  ? `${roots?.tv || '/media/TVShows'}/${showFolderName}`
+                  : roots?.movies || '/media/Movies'
+              }
             />
             <p className="text-[11px] text-faint mt-1">
-              默认：电影 {roots?.movies || '/media/Movies'} · 剧集 {roots?.tv || '/media/TVShows'}
-              。也可点下面文件夹浏览，或直接输入其它允许路径。
+              {kind === 'tv'
+                ? `默认进入当前剧文件夹：${roots?.tv || '/media/TVShows'}/${showFolderName}`
+                : `默认电影目录：${roots?.movies || '/media/Movies'}`}
+              。也可点下面浏览其它允许路径。
             </p>
           </div>
 
@@ -318,7 +420,11 @@ export function DownloadFolderPicker({
               className="flex-1 rounded-lg border border-line bg-chip px-3 py-2 text-sm text-content"
               value={newFolder}
               onChange={(e) => setNewFolder(e.target.value)}
-              placeholder="在当前目录新建文件夹名"
+              placeholder={
+                kind === 'tv' && showFolderName
+                  ? `新建文件夹（当前剧：${showFolderName}）`
+                  : '在当前目录新建文件夹名'
+              }
             />
             <button type="button" className="btn-ghost btn-sm shrink-0" onClick={() => void createFolder()}>
               新建

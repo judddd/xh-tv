@@ -1,15 +1,21 @@
 'use client';
 
 import Link from 'next/link';
-import { useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import { ThemeToggle } from './theme';
 import { SourceManagerDrawer } from './source-manager';
 import { HistoryPanel } from './history-panel';
-import { requestShowDownloadManager } from './download-manager';
+import {
+  DOWNLOADS_UPDATED_EVENT,
+  requestShowDownloadManager,
+} from './download-manager';
 import { Icon } from './icon';
 import { SearchHistoryDropdown, useSearchHistory } from './search-history';
+import { api, ApiError } from '@/lib/client-api';
 import { cn } from '@/lib/utils';
+
+const ACTIVE_DOWNLOAD_STATUSES = new Set(['waiting', 'downloading', 'paused']);
 
 /** 顶部导航：Logo、搜索框（首页外）、历史、设置 */
 export function Header({ showSearch = false }: { showSearch?: boolean }) {
@@ -18,8 +24,30 @@ export function Header({ showSearch = false }: { showSearch?: boolean }) {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [query, setQuery] = useState('');
+  const [activeDownloads, setActiveDownloads] = useState(0);
   // 与首页搜索框共用同一套「最近搜索」下拉逻辑
   const searchHistory = useSearchHistory(query);
+
+  const refreshActiveDownloads = useCallback(async () => {
+    try {
+      const data = await api.downloadList();
+      const n = (data.tasks || []).filter((t) => ACTIVE_DOWNLOAD_STATUSES.has(t.status)).length;
+      setActiveDownloads(n);
+    } catch (err) {
+      if (err instanceof ApiError && (err.status === 401 || err.status === 503)) return;
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshActiveDownloads();
+    const timer = setInterval(() => void refreshActiveDownloads(), 2000);
+    const onUpdated = () => void refreshActiveDownloads();
+    window.addEventListener(DOWNLOADS_UPDATED_EVENT, onUpdated);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener(DOWNLOADS_UPDATED_EVENT, onUpdated);
+    };
+  }, [refreshActiveDownloads]);
 
   const submitSearch = (text: string) => {
     const q = text.trim().slice(0, 100);
@@ -107,7 +135,15 @@ export function Header({ showSearch = false }: { showSearch?: boolean }) {
             <IconButton label="观看历史" onClick={() => setHistoryOpen(true)}>
               <Icon name="clock" />
             </IconButton>
-            <IconButton label="下载管理" onClick={requestShowDownloadManager}>
+            <IconButton
+              label={
+                activeDownloads > 0
+                  ? `下载管理（${activeDownloads} 个进行中）`
+                  : '下载管理'
+              }
+              onClick={requestShowDownloadManager}
+              badge={activeDownloads}
+            >
               <Icon name="download" />
             </IconButton>
             <IconButton label="设置" onClick={() => setSettingsOpen(true)}>
@@ -137,15 +173,35 @@ function HeaderLink({ href, active, children }: { href: string; active: boolean;
   );
 }
 
-function IconButton({ label, onClick, children }: { label: string; onClick: () => void; children: React.ReactNode }) {
+function IconButton({
+  label,
+  onClick,
+  children,
+  badge,
+}: {
+  label: string;
+  onClick: () => void;
+  children: React.ReactNode;
+  /** 进行中数量；>0 时在图标旁高亮显示 */
+  badge?: number;
+}) {
+  const showBadge = typeof badge === 'number' && badge > 0;
   return (
     <button
-      className="p-2 rounded-md text-muted hover:text-content hover:bg-hover transition-colors"
+      className="relative p-2 rounded-md text-muted hover:text-content hover:bg-hover transition-colors"
       title={label}
       aria-label={label}
       onClick={onClick}
     >
       {children}
+      {showBadge && (
+        <span
+          className="absolute -top-0.5 -right-0.5 min-w-[1.125rem] h-[1.125rem] px-1 rounded-full bg-accent text-on-accent text-[10px] font-semibold leading-[1.125rem] text-center tabular-nums shadow-sm ring-2 ring-surface"
+          aria-hidden
+        >
+          {badge > 99 ? '99+' : badge}
+        </span>
+      )}
     </button>
   );
 }
