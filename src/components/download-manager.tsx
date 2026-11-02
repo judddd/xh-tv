@@ -51,6 +51,17 @@ export function DownloadManager({ isOpen, onClose }: { isOpen: boolean; onClose:
   const [tasks, setTasks] = useState<ServerDownloadTask[]>([]);
   const [roots, setRoots] = useState<{ movies: string; tv: string } | null>(null);
   const [pending, setPending] = useState<Pending | null>(null);
+  /** 展开分集详情的任务 id */
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(() => new Set());
+
+  const toggleExpanded = useCallback((id: string) => {
+    setExpandedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
@@ -260,7 +271,22 @@ export function DownloadManager({ isOpen, onClose }: { isOpen: boolean; onClose:
     if (phase === 'mux') return '封装';
     if (phase === 'verify') return '校验';
     if (phase === 'filter') return '去广告';
+    if (phase === 'done') return '完成';
     return null;
+  };
+
+  const formatDuration = (sec?: number) => {
+    if (!sec || sec <= 0) return null;
+    const m = Math.floor(sec / 60);
+    const s = Math.round(sec % 60);
+    return m > 0 ? `${m}分${String(s).padStart(2, '0')}秒` : `${s}秒`;
+  };
+
+  const episodeStatusClass = (status: ServerDownloadTask['status']) => {
+    if (status === 'completed') return 'text-accent';
+    if (status === 'error' || status === 'cancelled') return 'text-amber-600 dark:text-amber-400';
+    if (status === 'downloading') return 'text-content';
+    return 'text-faint';
   };
 
   const pickerDefaultKind: MediaKind =
@@ -387,12 +413,90 @@ export function DownloadManager({ isOpen, onClose }: { isOpen: boolean; onClose:
               {(t.status === 'downloading' ||
                 t.status === 'paused' ||
                 t.status === 'waiting' ||
-                t.status === 'completed') && (
-                <div className="h-1.5 rounded-full bg-chip overflow-hidden">
-                  <div
-                    className="h-full bg-accent transition-all"
-                    style={{ width: `${Math.min(100, Math.max(0, t.progress))}%` }}
-                  />
+                t.status === 'completed' ||
+                t.status === 'error') && (
+                <button
+                  type="button"
+                  className="w-full text-left group"
+                  onClick={() => toggleExpanded(t.id)}
+                  aria-expanded={expandedIds.has(t.id)}
+                  title="点击查看每集下载与校验详情"
+                >
+                  <div className="h-1.5 rounded-full bg-chip overflow-hidden">
+                    <div
+                      className={cn(
+                        'h-full transition-all',
+                        t.status === 'error' ? 'bg-amber-500' : 'bg-accent'
+                      )}
+                      style={{ width: `${Math.min(100, Math.max(0, t.progress))}%` }}
+                    />
+                  </div>
+                  <p className="text-[11px] text-faint mt-1 group-hover:text-muted">
+                    {expandedIds.has(t.id) ? '收起详情' : '点击进度条查看每集下载 / 校验详情'}
+                    {t.episodes.length > 0
+                      ? ` · ${t.episodes.filter((e) => e.status === 'completed').length}/${t.episodes.length} 集`
+                      : ''}
+                  </p>
+                </button>
+              )}
+
+              {expandedIds.has(t.id) && (
+                <div className="rounded-lg border border-line bg-chip/40 max-h-64 overflow-y-auto divide-y divide-line">
+                  {t.episodes.map((ep, idx) => {
+                    const epNo =
+                      ep.episode && ep.episode > 0
+                        ? `E${String(ep.episode).padStart(2, '0')}`
+                        : `#${idx + 1}`;
+                    const season =
+                      ep.season && ep.season > 0 ? `S${String(ep.season).padStart(2, '0')}` : null;
+                    const dur = formatDuration(ep.verifiedDurationSec);
+                    const spd = formatSpeed(ep.speedBps);
+                    const phase = phaseLabel(ep.phase);
+                    return (
+                      <div key={`${t.id}-${idx}`} className="px-2.5 py-2 space-y-0.5">
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="text-xs text-content tabular-nums shrink-0">
+                            {season ? `${season}${epNo}` : epNo}
+                            {ep.title ? (
+                              <span className="text-faint font-normal"> · {ep.title}</span>
+                            ) : null}
+                          </p>
+                          <p className={cn('text-xs shrink-0 tabular-nums', episodeStatusClass(ep.status))}>
+                            {statusLabel[ep.status]}
+                            {ep.progress > 0 && ep.status === 'downloading' ? ` ${ep.progress}%` : ''}
+                          </p>
+                        </div>
+                        {(phase || spd || dur || ep.adFilter || ep.message) && (
+                          <p className="text-[11px] text-muted break-all">
+                            {[
+                              phase,
+                              spd,
+                              dur ? `校验时长 ${dur}` : null,
+                              ep.adFilter?.status === 'removed'
+                                ? ep.adFilter.label
+                                : ep.adFilter?.status === 'none' && ep.status === 'completed'
+                                  ? '无广告标记'
+                                  : null,
+                              ep.message && ep.message !== ep.adFilter?.label ? ep.message : null,
+                            ]
+                              .filter(Boolean)
+                              .join(' · ')}
+                          </p>
+                        )}
+                        {ep.status === 'downloading' && (
+                          <div className="h-1 rounded-full bg-chip overflow-hidden">
+                            <div
+                              className="h-full bg-accent/80 transition-all"
+                              style={{ width: `${Math.min(100, Math.max(0, ep.progress))}%` }}
+                            />
+                          </div>
+                        )}
+                        {ep.outputPath && (ep.status === 'completed' || ep.status === 'error') && (
+                          <p className="text-[10px] text-faint break-all">{ep.outputPath}</p>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </div>
