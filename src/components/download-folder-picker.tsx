@@ -256,7 +256,7 @@ export function DownloadFolderPicker({
 
           <p className="text-[11px] text-faint leading-relaxed">
             下载时自动按源站广告标记（如 adjump / 可识别中插段）剔除；无标记的源会提示「可能仍有残留」，不事后裁切正片。
-            剧集落盘为 Emby 结构：剧名/Season N/剧名 SxxExx.mp4（默认选 TVShows 根目录即可，勿再手动套一层剧名）。
+            剧集落盘为 Emby 结构：剧名/Season N/剧名 SxxExx.mp4（请选 TVShows 根目录；选到剧名/Season 也会自动归一，避免套娃）。
           </p>
 
           <div>

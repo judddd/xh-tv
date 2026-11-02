@@ -258,6 +258,7 @@ export function DownloadManager({ isOpen, onClose }: { isOpen: boolean; onClose:
   const phaseLabel = (phase?: string) => {
     if (phase === 'segments') return '拉片';
     if (phase === 'mux') return '封装';
+    if (phase === 'verify') return '校验';
     if (phase === 'filter') return '去广告';
     return null;
   };

@@ -19,7 +19,7 @@ export interface AdFilterInfo {
   removedSeconds?: number;
 }
 
-export type DownloadPhase = 'queued' | 'filter' | 'segments' | 'mux' | 'done';
+export type DownloadPhase = 'queued' | 'filter' | 'segments' | 'mux' | 'verify' | 'done';
 
 export interface ServerDownloadTask {
   id: string;
@@ -54,6 +54,8 @@ export interface ServerDownloadTask {
     adFilter?: AdFilterInfo;
     speedBps?: number;
     phase?: DownloadPhase;
+    /** 校验通过后的成片时长（秒） */
+    verifiedDurationSec?: number;
   }>;
   createdAt: number;
   updatedAt: number;

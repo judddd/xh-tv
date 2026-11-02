@@ -62,6 +62,13 @@ const FFMPEG_RETRIES = Math.max(1, parseInt(process.env.DOWNLOAD_RETRIES || '3',
 /** segments=并行拉片+本地封装（默认）；ffmpeg=旧链路直拉 */
 const DOWNLOAD_ENGINE = (process.env.DOWNLOAD_ENGINE || 'segments').toLowerCase();
 const KEEP_SEGS = process.env.DOWNLOAD_KEEP_SEGS === '1';
+/** 单集整段（拉片+封装）失败后重试次数 */
+const EPISODE_FILE_RETRIES = Math.max(1, parseInt(process.env.DOWNLOAD_EPISODE_RETRIES || '3', 10) || 3);
+/** 全剧结束后对失败集再补几轮 */
+const EPISODE_GAP_RETRY_ROUNDS = Math.max(
+  0,
+  parseInt(process.env.DOWNLOAD_GAP_RETRY_ROUNDS || '2', 10) || 2
+);
 
 /** 可选下载根：默认含 Movies/TV 及其父目录，可用 DOWNLOAD_ALLOW_ROOTS 追加（逗号分隔） */
 function parseAllowRoots(): string[] {
@@ -328,6 +335,17 @@ function formatSxxExx(season: number, episode: number): string {
   return `S${String(season).padStart(2, '0')}E${String(episode).padStart(2, '0')}`;
 }
 
+/** 把用户选中的目录归一到「剧名」目录，避免 Season/剧名 套娃 */
+function resolveTvShowDir(baseDir: string, show: string): string {
+  let cur = path.resolve(baseDir);
+  // 剥掉误选的 Season N / Specials
+  while (/^Season\s+\d+$/i.test(path.basename(cur)) || /^Specials$/i.test(path.basename(cur))) {
+    cur = path.dirname(cur);
+  }
+  if (path.basename(cur) === show) return cur;
+  return path.join(cur, show);
+}
+
 /**
  * Emby 友好路径：
  * - 电影：`{base}/{剧名}.mp4`
@@ -358,11 +376,158 @@ function buildOutputPath(
   const epNum = fromCode?.episode || (episode && episode > 0 ? episode : 1);
   const code = formatSxxExx(season, epNum);
 
-  const baseResolved = path.resolve(baseDir);
-  const showDir =
-    path.basename(baseResolved) === show ? baseResolved : path.join(baseResolved, show);
+  const showDir = resolveTvShowDir(baseDir, show);
   const seasonDir = path.join(showDir, `Season ${season}`);
   return path.join(seasonDir, `${show} ${code}.mp4`);
+}
+
+const MIN_OUTPUT_BYTES = 1024 * 100;
+/** 成片相对源清单时长至少要达到该比例，否则视为未下全 */
+const MIN_DURATION_RATIO = Math.min(
+  0.99,
+  Math.max(0.5, parseFloat(process.env.DOWNLOAD_MIN_DURATION_RATIO || '0.92') || 0.92)
+);
+
+function assertOutputFile(outputPath: string): void {
+  if (!fs.existsSync(outputPath)) throw new Error('落盘文件不存在');
+  const size = fs.statSync(outputPath).size;
+  if (size < MIN_OUTPUT_BYTES) {
+    try {
+      fs.unlinkSync(outputPath);
+    } catch {
+      /* ignore */
+    }
+    throw new Error(`落盘文件过小（${size} 字节），已删除待重试`);
+  }
+}
+
+interface MediaProbe {
+  durationSec: number;
+  hasVideo: boolean;
+  hasAudio: boolean;
+  size: number;
+}
+
+/** ffprobe 校验：有时长、有视频轨；相对期望时长不能明显偏短 */
+function probeOutputMedia(filePath: string, signal: AbortSignal): Promise<MediaProbe | null> {
+  return new Promise((resolve) => {
+    const PROBE_TIMEOUT_MS = 20_000;
+    const args = [
+      '-v', 'error',
+      '-show_entries', 'format=duration:stream=codec_type',
+      '-of', 'json',
+      filePath,
+    ];
+    let settled = false;
+    const finish = (value: MediaProbe | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+      resolve(value);
+    };
+    let out = '';
+    let child: ChildProcess;
+    try {
+      child = spawn('ffprobe', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch {
+      finish(null);
+      return;
+    }
+    const onAbort = () => {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        /* ignore */
+      }
+      finish(null);
+    };
+    const timer = setTimeout(() => {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        /* ignore */
+      }
+      finish(null);
+    }, PROBE_TIMEOUT_MS);
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener('abort', onAbort, { once: true });
+    child.stdout?.on('data', (buf: Buffer) => {
+      out += buf.toString();
+    });
+    child.on('error', () => finish(null));
+    child.on('close', () => {
+      try {
+        const json = JSON.parse(out) as {
+          format?: { duration?: string };
+          streams?: Array<{ codec_type?: string }>;
+        };
+        const durationSec = parseFloat(json.format?.duration || '');
+        const streams = json.streams || [];
+        const hasVideo = streams.some((s) => s.codec_type === 'video');
+        const hasAudio = streams.some((s) => s.codec_type === 'audio');
+        if (!Number.isFinite(durationSec) || durationSec <= 0) {
+          finish(null);
+          return;
+        }
+        let size = 0;
+        try {
+          size = fs.statSync(filePath).size;
+        } catch {
+          /* ignore */
+        }
+        finish({ durationSec, hasVideo, hasAudio, size });
+      } catch {
+        finish(null);
+      }
+    });
+  });
+}
+
+/**
+ * 下载完成后的硬校验：文件大小 + ffprobe 可播 + 时长不低于源清单期望。
+ * 失败会删除残片，迫使重下。
+ */
+async function verifyOutputMedia(
+  outputPath: string,
+  signal: AbortSignal,
+  expectedDurationSec?: number | null
+): Promise<MediaProbe> {
+  assertOutputFile(outputPath);
+  const probe = await probeOutputMedia(outputPath, signal);
+  if (!probe) {
+    try {
+      fs.unlinkSync(outputPath);
+    } catch {
+      /* ignore */
+    }
+    throw new Error('成片校验失败：ffprobe 无法读取时长/流信息，已删除残片');
+  }
+  if (!probe.hasVideo) {
+    try {
+      fs.unlinkSync(outputPath);
+    } catch {
+      /* ignore */
+    }
+    throw new Error('成片校验失败：无视频轨，已删除残片');
+  }
+  if (expectedDurationSec && expectedDurationSec >= 60) {
+    const minOk = expectedDurationSec * MIN_DURATION_RATIO;
+    if (probe.durationSec + 1 < minOk) {
+      try {
+        fs.unlinkSync(outputPath);
+      } catch {
+        /* ignore */
+      }
+      throw new Error(
+        `成片未下全：时长 ${probe.durationSec.toFixed(0)}s / 期望约 ${expectedDurationSec.toFixed(0)}s（<${Math.round(MIN_DURATION_RATIO * 100)}%），已删除残片`
+      );
+    }
+  }
+  return probe;
 }
 
 async function assertUrlAllowed(url: string): Promise<void> {
@@ -528,6 +693,11 @@ type ProgressMeta = {
   detail?: string;
 };
 
+interface EpisodeDownloadResult {
+  adFilter: AdFilterInfo;
+  verifiedDurationSec?: number;
+}
+
 async function downloadEpisodeFile(
   taskId: string,
   url: string,
@@ -535,7 +705,7 @@ async function downloadEpisodeFile(
   signal: AbortSignal,
   onProgress: (pct: number, meta?: ProgressMeta) => void,
   onAdFilter?: (info: AdFilterInfo) => void
-): Promise<AdFilterInfo> {
+): Promise<EpisodeDownloadResult> {
   await assertUrlAllowed(url);
   // 必须保留 .mp4 后缀：ffmpeg 靠扩展名选 muxer，`.mp4.part` 会被当成未知格式
   const part = `${outputPath}.part.mp4`;
@@ -545,112 +715,138 @@ async function downloadEpisodeFile(
     if (fs.existsSync(part)) fs.unlinkSync(part);
   } catch { /* ignore */ }
 
-  // 已存在完整文件则跳过（无法回溯当时过滤结果）
-  if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 1024 * 100) {
-    const skipped: AdFilterInfo = { status: 'none', label: '已存在文件，跳过（未重跑去广告）' };
-    onAdFilter?.(skipped);
-    onProgress(100, { phase: 'done', speedBps: 0 });
-    return skipped;
+  // 已存在文件：仍做可播校验，坏片删掉重下
+  if (fs.existsSync(outputPath) && fs.statSync(outputPath).size >= MIN_OUTPUT_BYTES) {
+    onProgress(99, { phase: 'verify', detail: '校验已有成片', speedBps: 0 });
+    try {
+      const probe = await verifyOutputMedia(outputPath, signal, null);
+      const skipped: AdFilterInfo = { status: 'none', label: '已存在文件，校验通过（未重跑去广告）' };
+      onAdFilter?.(skipped);
+      onProgress(100, { phase: 'done', speedBps: 0 });
+      return { adFilter: skipped, verifiedDurationSec: probe.durationSec };
+    } catch {
+      // 残片已在 verify 里删除，继续正常下载
+      onProgress(0, { phase: 'filter', detail: '已有成片校验失败，重新下载', speedBps: 0 });
+    }
   }
 
-  onProgress(0, { phase: 'filter', detail: '去广告处理中', speedBps: 0 });
-  const prepared = await prepareFilteredPlaylist(url, signal);
-  const adFilter: AdFilterInfo = {
-    status: prepared.adFilter.status,
-    label: prepared.adFilter.label,
-    removedSegments: prepared.adFilter.removedSegments,
-    removedSeconds: prepared.adFilter.removedSeconds,
-  };
-  onAdFilter?.(adFilter);
+  let lastErr: unknown;
+  for (let fileAttempt = 1; fileAttempt <= EPISODE_FILE_RETRIES; fileAttempt++) {
+    if (signal.aborted) throw new Error('已取消');
+    await waitIfTaskPaused(taskId, signal);
 
-  const parsed = parseMediaPlaylist(prepared.playlistText);
-  const useSegments =
-    DOWNLOAD_ENGINE !== 'ffmpeg' && parsed.supportsParallel && parsed.segments.length > 0;
-  const durationSec = prepared.durationSec > 0 ? prepared.durationSec : parsed.totalDuration || null;
-
-  const runMux = async (input: string, mapProgress: (p: number) => number) => {
-    let lastErr: unknown;
-    for (let attempt = 1; attempt <= FFMPEG_RETRIES; attempt++) {
-      if (signal.aborted) throw new Error('已取消');
-      await waitIfTaskPaused(taskId, signal);
-      try {
-        await runFfmpegOnce(
-          taskId,
-          input,
-          part,
-          signal,
-          (pct) => onProgress(mapProgress(pct), { phase: 'mux', detail: '封装 MP4' }),
-          durationSec
-        );
-        fs.renameSync(part, outputPath);
-        return;
-      } catch (err) {
-        lastErr = err;
-        try {
-          if (fs.existsSync(part)) fs.unlinkSync(part);
-        } catch { /* ignore */ }
-        if (signal.aborted) throw new Error('已取消');
-        if (attempt < FFMPEG_RETRIES) await new Promise((r) => setTimeout(r, 1500 * attempt));
-      }
-    }
-    throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
-  };
-
-  try {
-    if (useSegments) {
-      fs.mkdirSync(segsDir, { recursive: true });
-      // 把过滤后的远程清单也存一份，便于续传/排障
-      try {
-        fs.writeFileSync(path.join(segsDir, 'source.m3u8'), prepared.playlistText, 'utf8');
-      } catch { /* ignore */ }
-
-      await downloadHlsSegments(prepared.playlistText, {
-        workDir: segsDir,
-        signal,
-        resume: true,
-        waitIfPaused: () => waitIfTaskPaused(taskId, signal),
-        onProgress: (p) => {
-          const pct = Math.min(90, Math.round((p.done / Math.max(1, p.total)) * 90));
-          onProgress(pct, {
-            phase: 'segments',
-            speedBps: p.speedBps,
-            detail: `拉片 ${p.done}/${p.total} · ${formatSpeedBps(p.speedBps)}`,
-          });
-        },
-      });
-
-      const localList = path.join(segsDir, 'index.local.m3u8');
-      onProgress(90, { phase: 'mux', speedBps: 0, detail: '封装 MP4' });
-      await runMux(localList, (pct) => 90 + Math.round((pct / 100) * 9));
-
-      if (!KEEP_SEGS) {
-        try {
-          fs.rmSync(segsDir, { recursive: true, force: true });
-        } catch { /* ignore */ }
-      }
-      onProgress(100, { phase: 'done', speedBps: 0 });
-      return adFilter;
-    }
-
-    // 回退：ffmpeg 直拉（SAMPLE-AES / 显式 DOWNLOAD_ENGINE=ffmpeg）
-    onProgress(1, {
-      phase: 'mux',
-      detail: parsed.unsupportedReason
-        ? `回退 ffmpeg（${parsed.unsupportedReason}）`
-        : 'ffmpeg 直拉',
+    onProgress(0, {
+      phase: 'filter',
+      detail: fileAttempt > 1 ? `去广告处理中（重试 ${fileAttempt}/${EPISODE_FILE_RETRIES}）` : '去广告处理中',
       speedBps: 0,
     });
-    // 时长未知时再 probe
-    const dur =
-      durationSec && durationSec > 0
-        ? durationSec
-        : await probeDurationSec(prepared.localPath, signal);
-    await runMux(prepared.localPath, (pct) => pct);
-    onProgress(100, { phase: 'done', speedBps: 0 });
-    return adFilter;
-  } finally {
-    prepared.cleanup();
+    const prepared = await prepareFilteredPlaylist(url, signal);
+    const adFilter: AdFilterInfo = {
+      status: prepared.adFilter.status,
+      label: prepared.adFilter.label,
+      removedSegments: prepared.adFilter.removedSegments,
+      removedSeconds: prepared.adFilter.removedSeconds,
+    };
+    onAdFilter?.(adFilter);
+
+    const parsed = parseMediaPlaylist(prepared.playlistText);
+    const useSegments =
+      DOWNLOAD_ENGINE !== 'ffmpeg' && parsed.supportsParallel && parsed.segments.length > 0;
+    const durationSec = prepared.durationSec > 0 ? prepared.durationSec : parsed.totalDuration || null;
+
+    const runMux = async (input: string, mapProgress: (p: number) => number) => {
+      let muxErr: unknown;
+      for (let attempt = 1; attempt <= FFMPEG_RETRIES; attempt++) {
+        if (signal.aborted) throw new Error('已取消');
+        await waitIfTaskPaused(taskId, signal);
+        try {
+          await runFfmpegOnce(
+            taskId,
+            input,
+            part,
+            signal,
+            (pct) => onProgress(mapProgress(pct), { phase: 'mux', detail: '封装 MP4' }),
+            durationSec
+          );
+          fs.renameSync(part, outputPath);
+          return;
+        } catch (err) {
+          muxErr = err;
+          try {
+            if (fs.existsSync(part)) fs.unlinkSync(part);
+          } catch { /* ignore */ }
+          if (signal.aborted) throw new Error('已取消');
+          if (attempt < FFMPEG_RETRIES) await new Promise((r) => setTimeout(r, 1500 * attempt));
+        }
+      }
+      throw muxErr instanceof Error ? muxErr : new Error(String(muxErr));
+    };
+
+    try {
+      if (useSegments) {
+        fs.mkdirSync(segsDir, { recursive: true });
+        try {
+          fs.writeFileSync(path.join(segsDir, 'source.m3u8'), prepared.playlistText, 'utf8');
+        } catch { /* ignore */ }
+
+        await downloadHlsSegments(prepared.playlistText, {
+          workDir: segsDir,
+          signal,
+          resume: true,
+          waitIfPaused: () => waitIfTaskPaused(taskId, signal),
+          onProgress: (p) => {
+            const pct = Math.min(88, Math.round((p.done / Math.max(1, p.total)) * 88));
+            onProgress(pct, {
+              phase: 'segments',
+              speedBps: p.speedBps,
+              detail: `拉片 ${p.done}/${p.total} · ${formatSpeedBps(p.speedBps)}`,
+            });
+          },
+        });
+
+        const localList = path.join(segsDir, 'index.local.m3u8');
+        onProgress(88, { phase: 'mux', speedBps: 0, detail: '封装 MP4' });
+        await runMux(localList, (pct) => 88 + Math.round((pct / 100) * 7));
+
+        if (!KEEP_SEGS) {
+          try {
+            fs.rmSync(segsDir, { recursive: true, force: true });
+          } catch { /* ignore */ }
+        }
+        onProgress(96, { phase: 'verify', speedBps: 0, detail: '校验成片完整性' });
+        const probe = await verifyOutputMedia(outputPath, signal, durationSec);
+        onProgress(100, { phase: 'done', speedBps: 0, detail: `校验通过 · ${Math.round(probe.durationSec)}s` });
+        return { adFilter, verifiedDurationSec: probe.durationSec };
+      }
+
+      onProgress(1, {
+        phase: 'mux',
+        detail: parsed.unsupportedReason
+          ? `回退 ffmpeg（${parsed.unsupportedReason}）`
+          : 'ffmpeg 直拉',
+        speedBps: 0,
+      });
+      await runMux(prepared.localPath, (pct) => Math.min(95, pct));
+      onProgress(96, { phase: 'verify', speedBps: 0, detail: '校验成片完整性' });
+      const probe = await verifyOutputMedia(outputPath, signal, durationSec);
+      onProgress(100, { phase: 'done', speedBps: 0, detail: `校验通过 · ${Math.round(probe.durationSec)}s` });
+      return { adFilter, verifiedDurationSec: probe.durationSec };
+    } catch (err) {
+      lastErr = err;
+      if (signal.aborted) throw new Error('已取消');
+      if (fileAttempt < EPISODE_FILE_RETRIES) {
+        onProgress(0, {
+          phase: 'filter',
+          detail: `本集失败，准备重试（${fileAttempt}/${EPISODE_FILE_RETRIES}）：${err instanceof Error ? err.message : String(err)}`.slice(0, 120),
+          speedBps: 0,
+        });
+        await new Promise((r) => setTimeout(r, 1500 * fileAttempt));
+      }
+    } finally {
+      prepared.cleanup();
+    }
   }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
 
 function refreshTaskProgress(task: ServerDownloadTask): void {
@@ -674,76 +870,129 @@ function refreshTaskProgress(task: ServerDownloadTask): void {
   });
 }
 
-/** 有限并发跑集数；单集失败不拖垮全剧（取消除外） */
+function episodeLabel(ep: ServerDownloadTask['episodes'][number], index: number): string {
+  if (ep.episode && ep.episode > 0) return `E${String(ep.episode).padStart(2, '0')}`;
+  return `#${index + 1}`;
+}
+
+/** 有限并发跑集数；单集失败不拖垮全剧，结束后自动补下失败集 */
 async function runEpisodesPool(
   task: ServerDownloadTask,
   signal: AbortSignal,
   indices: number[]
 ): Promise<void> {
   const total = task.episodes.length;
-  let cursor = 0;
   let cancelledErr: unknown;
 
-  const worker = async () => {
-    while (true) {
-      if (signal.aborted) throw new Error('已取消');
-      const my = cursor++;
-      if (my >= indices.length) return;
-      const i = indices[my];
-      const ep = task.episodes[i];
+  const runBatch = async (batch: number[]) => {
+    if (!batch.length) return;
+    let cursor = 0;
+    const worker = async () => {
+      while (true) {
+        if (signal.aborted) throw new Error('已取消');
+        const my = cursor++;
+        if (my >= batch.length) return;
+        const i = batch[my];
+        const ep = task.episodes[i];
 
-      ep.status = 'downloading';
-      ep.progress = 0;
-      ep.message = '下载中';
-      refreshTaskProgress(task);
-
-      try {
-        const adFilter = await downloadEpisodeFile(
-          task.id,
-          ep.url,
-          ep.outputPath!,
-          signal,
-          (pct, meta) => {
-            if (task.status === 'paused') return;
-            ep.progress = pct;
-            if (meta?.speedBps != null) ep.speedBps = meta.speedBps;
-            if (meta?.phase) ep.phase = meta.phase;
-            if (meta?.detail) ep.message = meta.detail;
-            refreshTaskProgress(task);
-          },
-          (info) => {
-            ep.adFilter = info;
-            ep.message = info.label;
-            refreshTaskProgress(task);
-          }
-        );
-        ep.adFilter = adFilter;
-        ep.status = 'completed';
-        ep.progress = 100;
-        ep.speedBps = 0;
-        ep.phase = 'done';
-        ep.message = adFilter.label;
+        ep.status = 'downloading';
+        ep.progress = 0;
+        ep.message = '下载中';
         refreshTaskProgress(task);
-      } catch (err) {
-        ep.status = signal.aborted ? 'cancelled' : 'error';
-        ep.message = err instanceof Error ? err.message : String(err);
-        touch(task);
-        if (signal.aborted) {
-          cancelledErr = err;
-          throw err;
+
+        try {
+          const result = await downloadEpisodeFile(
+            task.id,
+            ep.url,
+            ep.outputPath!,
+            signal,
+            (pct, meta) => {
+              if (task.status === 'paused') return;
+              ep.progress = pct;
+              if (meta?.speedBps != null) ep.speedBps = meta.speedBps;
+              if (meta?.phase) ep.phase = meta.phase;
+              if (meta?.detail) ep.message = meta.detail;
+              refreshTaskProgress(task);
+            },
+            (info) => {
+              ep.adFilter = info;
+              ep.message = info.label;
+              refreshTaskProgress(task);
+            }
+          );
+          ep.adFilter = result.adFilter;
+          ep.verifiedDurationSec = result.verifiedDurationSec;
+          ep.status = 'completed';
+          ep.progress = 100;
+          ep.speedBps = 0;
+          ep.phase = 'done';
+          ep.message = result.verifiedDurationSec
+            ? `${result.adFilter.label} · 校验通过 ${Math.round(result.verifiedDurationSec)}s`
+            : result.adFilter.label;
+          refreshTaskProgress(task);
+        } catch (err) {
+          ep.status = signal.aborted ? 'cancelled' : 'error';
+          ep.progress = Math.min(ep.progress || 0, 99);
+          ep.speedBps = 0;
+          ep.message = err instanceof Error ? err.message : String(err);
+          touch(task);
+          if (signal.aborted) {
+            cancelledErr = err;
+            throw err;
+          }
+          if (total === 1) throw err;
         }
-        if (total === 1) throw err;
       }
+    };
+
+    const n = Math.min(EPISODE_CONCURRENCY, batch.length);
+    const results = await Promise.allSettled(Array.from({ length: n }, () => worker()));
+    if (signal.aborted || cancelledErr) {
+      throw cancelledErr instanceof Error ? cancelledErr : new Error('已取消');
     }
+    const hard = results.find(
+      (r) => r.status === 'rejected' && !(r.reason instanceof Error && r.reason.message === '已取消')
+    );
+    if (total === 1 && hard && hard.status === 'rejected') throw hard.reason;
   };
 
-  const n = Math.min(EPISODE_CONCURRENCY, indices.length);
-  const results = await Promise.allSettled(Array.from({ length: n }, () => worker()));
-  if (signal.aborted || cancelledErr) throw cancelledErr instanceof Error ? cancelledErr : new Error('已取消');
-  const hard = results.find(
-    (r) => r.status === 'rejected' && !(r.reason instanceof Error && r.reason.message === '已取消')
-  );
-  if (total === 1 && hard && hard.status === 'rejected') throw hard.reason;
+  await runBatch(indices);
+
+  // 全剧缺口补下：失败 / 声称完成但文件不在
+  for (let round = 1; round <= EPISODE_GAP_RETRY_ROUNDS; round++) {
+    if (signal.aborted) throw new Error('已取消');
+    const gaps: number[] = [];
+    for (const i of indices) {
+      const ep = task.episodes[i];
+      if (ep.status === 'error' || ep.status === 'cancelled') {
+        gaps.push(i);
+        continue;
+      }
+      if (ep.status === 'completed') {
+        try {
+          const probe = await verifyOutputMedia(ep.outputPath!, signal, null);
+          ep.verifiedDurationSec = probe.durationSec;
+        } catch {
+          ep.status = 'error';
+          ep.message = '完成后文件校验失败，准备补下';
+          gaps.push(i);
+        }
+      }
+    }
+    if (!gaps.length) break;
+    const labels = gaps.map((i) => episodeLabel(task.episodes[i], i)).join('、');
+    touch(task, {
+      status: 'downloading',
+      message: `补下缺集 ${gaps.length} 集（第 ${round}/${EPISODE_GAP_RETRY_ROUNDS} 轮）：${labels}`.slice(0, 160),
+    });
+    for (const i of gaps) {
+      const ep = task.episodes[i];
+      ep.status = 'waiting';
+      ep.progress = 0;
+      ep.message = `补下排队（第 ${round} 轮）`;
+    }
+    await runBatch(gaps);
+  }
 }
 
 async function runTask(task: ServerDownloadTask): Promise<void> {
@@ -758,9 +1007,16 @@ async function runTask(task: ServerDownloadTask): Promise<void> {
     const pending: number[] = [];
     for (let i = 0; i < task.episodes.length; i++) {
       const ep = task.episodes[i];
-      if (ep.status === 'completed' && ep.outputPath && fs.existsSync(ep.outputPath)) {
-        ep.progress = 100;
-        continue;
+      if (ep.status === 'completed' && ep.outputPath) {
+        try {
+          const probe = await verifyOutputMedia(ep.outputPath, signal, null);
+          ep.verifiedDurationSec = probe.durationSec;
+          ep.progress = 100;
+          continue;
+        } catch {
+          ep.status = 'waiting';
+          ep.message = '文件校验失败，重新下载';
+        }
       }
       pending.push(i);
     }
@@ -770,10 +1026,45 @@ async function runTask(task: ServerDownloadTask): Promise<void> {
       await runEpisodesPool(task, signal, pending);
     }
 
-    const failed = task.episodes.filter((e) => e.status === 'error').length;
+    // 最终再扫一遍：完成态必须通过可播校验
+    touch(task, { message: '最终校验全部成片…', phase: 'verify', speedBps: 0 });
+    for (const ep of task.episodes) {
+      if (ep.status !== 'completed' || !ep.outputPath) continue;
+      try {
+        const probe = await verifyOutputMedia(ep.outputPath, signal, null);
+        ep.verifiedDurationSec = probe.durationSec;
+        if (!ep.message?.includes('校验通过')) {
+          ep.message = `${ep.message || '完成'} · 校验通过 ${Math.round(probe.durationSec)}s`;
+        }
+      } catch (err) {
+        ep.status = 'error';
+        ep.message = err instanceof Error ? err.message : String(err);
+      }
+    }
+
+    const failedEps = task.episodes.filter((e) => e.status === 'error' || e.status === 'cancelled');
+    const failed = failedEps.length;
     const completed = task.episodes.filter((e) => e.status === 'completed').length;
     if (completed === 0) {
-      touch(task, { status: 'error', message: failed ? '全部失败' : '无成功文件', progress: 0 });
+      touch(task, {
+        status: 'error',
+        message: failed ? `全部失败（${failed} 集）` : '无成功文件',
+        progress: 0,
+        speedBps: 0,
+      });
+      return;
+    }
+    if (failed > 0) {
+      const labels = failedEps
+        .map((e, idx) => episodeLabel(e, task.episodes.indexOf(e) >= 0 ? task.episodes.indexOf(e) : idx))
+        .slice(0, 12)
+        .join('、');
+      touch(task, {
+        status: 'error',
+        progress: Math.round((completed / total) * 100),
+        speedBps: 0,
+        message: `仍缺 ${failed}/${total} 集未完成：${labels}${failed > 12 ? '…' : ''}（可点重试）`.slice(0, 200),
+      });
       return;
     }
     const removedEps = task.episodes.filter((e) => e.adFilter?.status === 'removed');
@@ -798,9 +1089,7 @@ async function runTask(task: ServerDownloadTask): Promise<void> {
         : firstOut
           ? path.dirname(path.dirname(firstOut))
           : undefined;
-    const baseMsg = failed
-      ? `完成 ${completed}/${total}（${failed} 集失败）· ${adFilter.label}`
-      : `全部完成 · ${adFilter.label}`;
+    const baseMsg = `全部完成并校验通过（${completed} 集）· ${adFilter.label}`;
     touch(task, {
       status: 'completed',
       progress: 100,
@@ -928,11 +1217,16 @@ export async function createServerDownload(input: CreateInput): Promise<ServerDo
   const kind = resolveKind(input.kind, input.episodes.length);
   const baseDir = resolveBaseDir(kind, input.targetDir);
 
-  // 预先校验 URL
-  for (const ep of input.episodes) {
-    if (!ep.url) throw new Error('存在空播放地址');
+  // 预先校验 URL；过滤空地址，避免「全集缺几集」里混进无效条目
+  const cleaned = input.episodes.filter((ep) => Boolean(ep?.url?.trim()));
+  if (!cleaned.length) throw new Error('缺少有效播放地址');
+  if (cleaned.length !== input.episodes.length) {
+    // 保留有效集，后续仍按原 episode 编号落盘
+  }
+  for (const ep of cleaned) {
     await assertUrlAllowed(ep.url);
   }
+  input = { ...input, episodes: cleaned };
 
   const id = `sdl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const now = Date.now();

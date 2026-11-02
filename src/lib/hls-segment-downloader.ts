@@ -316,83 +316,110 @@ export async function downloadHlsSegments(
   };
   report();
 
-  const pending = parsed.segments.filter((s) => !present[s.index]);
-  let cursor = 0;
-  let firstErr: unknown;
+  const downloadOne = async (seg: HlsSegment, retries: number): Promise<void> => {
+    const fp = path.join(workDir, segFileName(seg.index));
+    const tmp = `${fp}.part`;
+    let attempt = 0;
+    let lastErr: unknown;
+    while (attempt < retries) {
+      attempt += 1;
+      try {
+        if (opts.signal.aborted) throw new Error('已取消');
+        if (opts.waitIfPaused) await opts.waitIfPaused();
 
-  const worker = async () => {
-    while (true) {
-      if (opts.signal.aborted) throw new Error('已取消');
-      if (opts.waitIfPaused) await opts.waitIfPaused();
-      if (firstErr) return;
-      const my = cursor++;
-      if (my >= pending.length) return;
-      const seg = pending[my];
-      const fp = path.join(workDir, segFileName(seg.index));
-      const tmp = `${fp}.part`;
-
-      let attempt = 0;
-      while (true) {
-        attempt += 1;
-        try {
-          if (opts.signal.aborted) throw new Error('已取消');
-          if (opts.waitIfPaused) await opts.waitIfPaused();
-
-          await globalSegmentSemaphore.run(async () => {
-            let body = await fetchBuffer(seg.url, opts.signal, seg.byteRange);
-            if (seg.key.method === 'AES-128') {
-              if (!seg.key.uri) throw new Error(`分片 ${seg.index} 缺少 KEY URI`);
-              let keyBuf = keyCache.get(seg.key.uri);
-              if (!keyBuf) {
-                keyBuf = await fetchBuffer(seg.key.uri, opts.signal);
-                if (keyBuf.length !== 16) {
-                  // 有的 key 服务多返回；取前 16
-                  if (keyBuf.length > 16) keyBuf = keyBuf.subarray(0, 16);
-                  else throw new Error(`KEY 长度异常：${keyBuf.length}`);
-                }
-                keyCache.set(seg.key.uri, keyBuf);
+        await globalSegmentSemaphore.run(async () => {
+          let body = await fetchBuffer(seg.url, opts.signal, seg.byteRange);
+          if (seg.key.method === 'AES-128') {
+            if (!seg.key.uri) throw new Error(`分片 ${seg.index} 缺少 KEY URI`);
+            let keyBuf = keyCache.get(seg.key.uri);
+            if (!keyBuf) {
+              keyBuf = await fetchBuffer(seg.key.uri, opts.signal);
+              if (keyBuf.length !== 16) {
+                if (keyBuf.length > 16) keyBuf = keyBuf.subarray(0, 16);
+                else throw new Error(`KEY 长度异常：${keyBuf.length}`);
               }
-              const iv = seg.key.iv ?? parseIv(undefined, seg.mediaSequence);
-              body = aes128Decrypt(body, keyBuf, iv);
+              keyCache.set(seg.key.uri, keyBuf);
             }
-            fs.writeFileSync(tmp, body);
-            fs.renameSync(tmp, fp);
-            meter.add(body.length);
-          }, opts.signal);
+            const iv = seg.key.iv ?? parseIv(undefined, seg.mediaSequence);
+            body = aes128Decrypt(body, keyBuf, iv);
+          }
+          if (!body.length) throw new Error(`分片 ${seg.index} 为空`);
+          fs.writeFileSync(tmp, body);
+          fs.renameSync(tmp, fp);
+          meter.add(body.length);
+        }, opts.signal);
 
+        if (!present[seg.index]) {
           present[seg.index] = true;
           done += 1;
           report();
-          break;
-        } catch (err) {
-          try {
-            if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
-          } catch {
-            /* ignore */
-          }
-          if (opts.signal.aborted) throw err;
-          if (attempt >= SEGMENT_RETRIES) {
-            firstErr = err;
-            throw err;
-          }
-          await new Promise((r) => setTimeout(r, 400 * attempt));
         }
+        return;
+      } catch (err) {
+        lastErr = err;
+        try {
+          if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+        } catch {
+          /* ignore */
+        }
+        if (opts.signal.aborted) throw err;
+        if (attempt < retries) await new Promise((r) => setTimeout(r, 500 * attempt));
       }
     }
+    throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
   };
 
-  const n = Math.min(concurrency, Math.max(1, pending.length));
-  if (pending.length > 0) {
-    const results = await Promise.allSettled(Array.from({ length: n }, () => worker()));
-    if (opts.signal.aborted) throw new Error('已取消');
-    const rejected = results.find((r) => r.status === 'rejected');
-    if (rejected && rejected.status === 'rejected') {
-      throw rejected.reason instanceof Error ? rejected.reason : new Error(String(rejected.reason));
-    }
-  }
+  /** 跑一轮：失败分片不拖垮其它，最后统一补下 */
+  const runRound = async (list: HlsSegment[], retries: number, parallel: number) => {
+    let cursor = 0;
+    const failures: Array<{ seg: HlsSegment; err: unknown }> = [];
+    const worker = async () => {
+      while (true) {
+        if (opts.signal.aborted) throw new Error('已取消');
+        if (opts.waitIfPaused) await opts.waitIfPaused();
+        const my = cursor++;
+        if (my >= list.length) return;
+        const seg = list[my];
+        if (present[seg.index]) continue;
+        try {
+          await downloadOne(seg, retries);
+        } catch (err) {
+          if (opts.signal.aborted) throw err;
+          failures.push({ seg, err });
+        }
+      }
+    };
+    const n = Math.min(parallel, Math.max(1, list.length));
+    await Promise.all(Array.from({ length: n }, () => worker()));
+    return failures;
+  };
 
-  if (!present.every(Boolean)) {
-    throw new Error(`分片不完整：${present.filter(Boolean).length}/${present.length}`);
+  let todo = parsed.segments.filter((s) => !present[s.index]);
+  if (todo.length > 0) {
+    // 第一轮：正常并行
+    let failures = await runRound(todo, SEGMENT_RETRIES, concurrency);
+    if (opts.signal.aborted) throw new Error('已取消');
+    // 第二轮：只补失败分片，降并发、加次数，避免 CDN 限流连锁缺片
+    todo = failures.map((f) => f.seg).filter((s) => !present[s.index]);
+    if (todo.length > 0) {
+      opts.onProgress?.({
+        done,
+        total: parsed.segments.length,
+        bytesTotal: meter.bytesTotal,
+        speedBps: meter.speedBps,
+        phase: 'segments',
+      });
+      failures = await runRound(todo, SEGMENT_RETRIES + 2, Math.max(2, Math.floor(concurrency / 2)));
+    }
+    if (opts.signal.aborted) throw new Error('已取消');
+    if (!present.every(Boolean)) {
+      const missing = present.map((ok, i) => (ok ? -1 : i)).filter((i) => i >= 0);
+      const hint = failures[0]?.err;
+      const why = hint instanceof Error ? hint.message : hint ? String(hint) : '';
+      throw new Error(
+        `分片不完整：${present.filter(Boolean).length}/${present.length}（缺 ${missing.slice(0, 8).join(',')}${missing.length > 8 ? '…' : ''}）${why ? `；${why}` : ''}`
+      );
+    }
   }
 
   const localPlaylist = writeLocalPlainPlaylist(workDir, parsed, present);
